@@ -9,44 +9,46 @@ You're picking up the Rust port of the Proton Drive SDK + `pdtui` TUI on the use
 3. [`docs/domain-model.md`](docs/domain-model.md) — Bounded contexts, ubiquitous language, aggregate→module map
 4. [`docs/IMPLEMENTATION-STATUS.md`](docs/IMPLEMENTATION-STATUS.md) — **What's done, what's stubbed, what needs live validation**
 
-## TL;DR — where things stand
+## TL;DR — where things stand (2026-05-28)
+
+All M0–M7 milestones now have a real implementation. 85 tests pass; the crypto
+layer is validated against JS-encoded wire fixtures. What's left is **live-API
+interop**, not scaffolding. Full detail in `docs/IMPLEMENTATION-STATUS.md`.
 
 | Layer | State | Trustable? |
 |---|---|---|
 | Workspace + traits + error model | Complete | Yes |
-| JSON DTOs for list/upload/download/events | Complete (happy-path subset) | Yes — schema roundtrips, untested against live API |
-| `ReqwestHttpClient` (retry/backoff/headers) | Complete | Yes — compiles, lint-clean, unverified against live API |
-| Crypto — passphrase + AEAD rejection | Complete | Yes |
-| Crypto — encrypt/decrypt/sign/verify | Stubbed | **No** — needs live fixtures |
-| SRP auth | Trait shape only | **No** — needs live endpoint to validate |
-| Upload/download block protocol | DTOs only | **No** — needs M2 + auth |
-| Events subscription | DTOs only | **No** — needs auth |
-| `pdtui` local pane | Real filesystem nav | Yes |
-| `pdtui` remote pane | Shows "auth not configured" placeholder | n/a |
+| JSON DTOs (list/upload/download/events) | Complete (happy-path subset) | Yes — roundtrips; live API untested |
+| `ReqwestHttpClient` (retry/backoff/headers) | Complete | Yes — lint-clean; live API untested |
+| Crypto — encrypt/decrypt/sign/verify | Complete | Yes — passes JS-encoded wire fixtures + tamper/wrong-signer rejection |
+| SRP auth (`proton-srp` 0.8.2) | Complete | Yes — unit-tested; live login untested |
+| `SessionManager` refresh (ADR-0010) | Complete | Yes — unit-tested |
+| Upload block protocol | Complete | **Partial** — blocked live by B1 (HMAC name hash → 422) |
+| Download block protocol | Complete | **Partial** — works for root-level files (B2) |
+| Events subscription | DTOs only | n/a — pull-on-focus for MVP |
+| `pdtui` local + remote panes | Complete | Yes — remote pane wired to real `PdtuiAccount` |
 
-## What you need to make progress on the Linux box
+## The one thing that blocks a live upload
 
-You need exactly **one** of these to unblock M2 crypto bodies and M3 auth:
+**B1 — name hash.** `upload.rs:~330` uses `SHA256(name)`; Proton wants
+`HMAC-SHA256(NodeHashKey, name)` where `NodeHashKey` comes from the parent
+folder's decrypted `FolderProperties`. Until this lands, file-create returns
+422. This is the highest-value next task. See `docs/IMPLEMENTATION-STATUS.md`
+§"Known blockers" for the full list (B1–B7), including B4 (zeroize recovered
+passphrases — security).
 
-**Option A (lowest risk):** Capture a HAR of an existing logged-in JS-SDK session against the user's account. Endpoints in `scripts/capture-fixtures.sh`. Sanitise to remove tokens before storing under `rust/fixtures/`.
-
-**Option B:** Run the JS SDK's CLI (`js/cli`) against the user's account once, save the captured network traffic, then port from observed bytes.
-
-**Option C:** Implement SRP from scratch against the live `/auth/v4` endpoint with the user's credentials. Burns rate budget on failure; have backoff in place.
-
-Either way, **never commit real account secrets** — the `.gitignore` already excludes `rust/.env` and `rust/fixtures/auth/*`.
+**Never commit real account secrets** — `.gitignore` excludes `rust/.env` and
+`rust/fixtures/auth/*`.
 
 ## Recommended order on the Linux box
 
-1. Run `scripts/setup.sh` — verifies toolchain, installs rust if missing, runs the full QE pass to prove the repo builds cleanly on the target machine.
-2. Run `scripts/smoke.sh` — boots `pdtui`, verifies local pane navigates, exits cleanly.
-3. **Decide auth strategy** (A/B/C above). The PRD already includes a `KeyringAccount` design — finishing it requires SRP working first.
-4. Land M2 crypto bodies. Use `pgp` 0.16 ops mirroring `js/sdk/src/crypto/openPGPCrypto.ts` exactly. Self-roundtrip-test each op before declaring done.
-5. Land M3 SRP. Pure-Rust crates: `srp` or `num-bigint`. Validate against a live login.
-6. Land M4 upload — port `js/sdk/src/internal/upload/` faithfully; the block-content-key + per-block manifest pattern is the structural anchor.
-7. Land M5 download — inverse of M4.
-8. Land M6 events — port `js/sdk/src/internal/events/`; assert no timer-driven listings in production paths (lint).
-9. Land M7 — wire `pdtui` remote pane to the SDK.
+1. Run the gate: `cargo fmt --all --check && cargo clippy --workspace --all-targets && cargo test --workspace` — expect 85 pass / 6 ignored.
+2. Boot `pdtui`, log in with real credentials (SRP is live), confirm the remote pane lists MyFiles root.
+3. **Fix B1** — decrypt parent `NodeHashKey`, compute `HMAC-SHA256` name hash. This unblocks the first real upload. Verify against the account.
+4. **Fix B4** alongside — wrap recovered passphrases in `Zeroizing`.
+5. Verify round-trip: upload a small file, download it, assert byte-identical.
+6. Then B2 (nested folders), B3 (XAttr mtime), B6 (partial-write cleanup), B7 (delete dead stub) as polish.
+7. M6 events consumer if live sync is wanted post-MVP.
 
 ## How to talk to the agents on the Linux machine
 
@@ -63,7 +65,10 @@ Skills/agents already wired into the user's setup:
 - `agentic-qe` (broken in container, working on host — try it on Linux)
 - ruflo / ruvector swarm tools (`mcp__ruvector__*`)
 
-Prior swarm `swarm_1779915934241_4kdqcse` is **retired**. `m1-protobuf-codegen` was wrong (DTOs are JSON, not protobuf — see Guardrails below). M1 JSON DTOs are already implemented in `proton-drive-api`; no replacement agent needed. Remaining live work: `m2-rpgp-impl` (crypto bodies), `m3-http-account` (SRP + keyring), `tui-wiring`, `qe-reviewer`.
+DTOs are JSON, not protobuf (see Guardrails below). M0–M7 are implemented and
+committed on `rust-port` (see `git log`: MB–MH waves). Remaining work is the
+B1–B7 live-interop blockers in `docs/IMPLEMENTATION-STATUS.md`, not new
+milestones — the agent mesh + QE pass that produced this state is complete.
 
 ## Guardrails worth keeping
 

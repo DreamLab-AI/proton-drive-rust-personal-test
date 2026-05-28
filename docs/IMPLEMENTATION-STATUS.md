@@ -1,90 +1,71 @@
-# Implementation Status — M0–M7 one-shot pass
+# Implementation Status — MVP upload/download + auth
 
-Date: 2026-05-27.
+Date: 2026-05-28. Branch: `rust-port`.
 
-Per the PRD §8 milestones. Each row marks **verifiable in this session** (V), **scaffolded** (S), or **deferred** (D).
+Supersedes the 2026-05-27 milestone snapshot. Every M0–M7 milestone now has a
+real implementation (no `NotImplemented` on the happy path). What remains are
+**live-account interop gaps** found by the QE pass — code that compiles, is
+unit/wire-tested, but has not been proven against the production API.
 
-| M | Goal | Status | Verification |
+## Milestone state
+
+| M | Goal | State | Evidence |
 |---|---|---|---|
-| M0 | Workspace + CI + trait surface | **V** | `cargo check/clippy/fmt/test/doc` all green; 1.6 MB release binary |
-| M1 | API DTOs | **V (revised)** | JSON DTOs via serde for happy-path subset; 2 round-trip tests against fixtures matching JS shape; **protobuf path abandoned** (see correction below) |
-| M2 | Crypto impl | **V (partial)** | `rpgp`/`pgp` 0.16 dep added; `generate_passphrase` returns RFC-shaped base64 of 32 random bytes; AEAD rejection live. Heavyweight ops still `NotImplemented` — they need live Proton-account fixtures to interop-test before trust |
-| M3 | HTTP + auth | **V (HTTP)** / **D (auth)** | `ReqwestHttpClient` with retry/backoff/jitter, `x-pm-appversion` injection, `Retry-After` honour, rate-limit mapping — all implemented and clippy-clean. SRP login flow deliberately deferred: requires Proton's specific SRP bigint protocol + live endpoint to validate; ships only as a trait shape |
-| M4 | Upload | **D** | Block-protocol DTOs in `proton-drive-api::upload` follow `js/sdk/src/internal/upload/`; client method still returns `NotImplemented`. Requires M2 crypto + M3 auth before any meaningful port |
-| M5 | Download | **D** | DTOs in `proton-drive-api::download`. Same dependency chain |
-| M6 | Events | **D** | DTOs in `proton-drive-api::events`. Same |
-| M7 | pdtui v0.1.0 | **V (local pane)** / **D (remote)** | Local pane: real filesystem navigation via `std::fs`, sorted, parent-first, error-tolerant, with unit tests. Remote pane: shows "auth not configured" state until M3-auth lands |
+| M0 | Workspace + CI + traits | Done | `cargo check/clippy/fmt/test/doc` green; deny-lints active |
+| M1 | JSON API DTOs | Done | serde round-trip tests; happy-path subset for list/upload/download/events |
+| M2 | Crypto (rpgp 0.16) | Done | `decrypt_session_key`, `encrypt_and_sign`, `decrypt_and_verify`, manifest sign/verify, `generate_passphrase`, AEAD rejection; validated by JS-encoded wire fixtures |
+| M3 | HTTP + SRP auth | Done | `ReqwestHttpClient` (retry/backoff/jitter/`x-pm-appversion`); SRP login via `proton-srp` 0.8.2 (`auth/info → SRP → auth`); `SessionManager` proactive + reactive refresh (ADR-0010) |
+| M4 | Upload block protocol | Done (interop gaps) | create file → request revision → 4 MiB chunk → encrypt+sign → block tokens → PUT BareURL → commit. See blockers below |
+| M5 | Download block protocol | Done (interop gaps) | get revision → decrypt content key → manifest verify → per-block GET/hash/decrypt-verify → stream. See blockers below |
+| M6 | Events | DTOs only | `proton-drive-api::events` shapes present; no consumer wired (pull-only listing for MVP, per domain-model-mvp.md) |
+| M7 | pdtui TUI | Done | local + remote panes, F3-upload/F2-download, progress gauge, `PdtuiAccount` key-unlock bootstrap, session persistence |
 
-## Correction: protobuf was the wrong M1
+## Test gate (end state)
 
-The PRD as drafted assumed M1 would codegen Rust types from `cs/sdk/src/protos/*.proto`. Mid-implementation I realised those protobufs are the **C-ABI marshalling layer** for Kotlin/Swift bindings — they are *not* what Proton's HTTP API speaks on the wire. Proton's API is JSON-over-HTTPS (see `js/sdk/src/internal/apiService/{driveTypes,coreTypes}.ts` — 40K LoC of generated OpenAPI types). M1 was therefore re-scoped to "hand-write happy-path JSON DTOs via serde."
+- `cargo fmt --all --check` — clean
+- `cargo clippy --workspace --all-targets` — clean (2 benign warnings: `session::logout` dead-code, `transfer.rs` `type_complexity`)
+- `cargo test --workspace` — **85 passing, 0 failing, 6 ignored**
+  - Ignored: live `auth_integration` (needs account), `wire_rust_encrypted_decryptable_by_node` (needs `node`+`openpgp` npm), `pdtui` spawn_upload/spawn_download live paths.
+- Wire-format fixtures (ADR-0012): JS→Rust decrypt+verify, tamper rejection, **wrong-signer rejection** all pass.
 
-The full OpenAPI surface is deliberately not ported — only the endpoints needed for list/upload/download/events are present. Adding more is mechanical.
+## Known blockers — require a live Proton account to close
 
-## Pivot during the session — TUI as test harness
+These gate a *successful live upload/download*. Severity is "will the happy path
+work against production today".
 
-User feedback mid-session: the TUI itself is boilerplate; better to use it to **test the SDK plumbing**. Acted on:
+| # | Blocker | Where | Effect | Severity |
+|---|---|---|---|---|
+| B1 | Name hash is `SHA256(name)`, not `HMAC-SHA256(NodeHashKey, name)` | `upload.rs:~330` (FIXME) | Server 422 on file create — needs parent `FolderProperties.NodeHashKey` decrypted | **Blocking upload** |
+| B2 | Nested-folder key derivation deferred | `download.rs` `decrypt_node_private_key` works for share-root children only | Files outside MyFiles root can't derive node key | High (MVP = root files) |
+| B3 | XAttr modification-time decrypt is a TODO; size-mismatch logs, not fatal | `download.rs:~355`, `~393` | Restored mtime not applied; corrupted-size XAttr not caught | Medium |
+| B4 | Recovered address-key + node passphrases held as plain `String`/`Vec<u8>` | `account.rs:~206`, `download.rs:~540` | Secret material not zeroized on drop (violates ADR-0011 spirit) | Medium (security) |
+| B5 | Detached per-block `enc_signature` fetched but not independently verified | `download.rs` | Inline block signature *is* verified (see C1 fix); detached sig is not a second gate | Low (manifest + inline cover integrity) |
+| B6 | Download partial-write leaves a truncated file on mid-stream failure | `download.rs:~148` | No cleanup of the caller's writer on error | Low |
+| B7 | Dead `decrypt_node_key` public stub returns `NotImplemented` | `download.rs:517` | Confusing API surface; real path is `decrypt_node_private_key` | Trivial (delete) |
 
-- Added `pdtui probe` subcommand: hits `core/v4/users`, `drive/shares`, `drive/v2/events/latest` with a manually-pasted session token. Exercises M1 DTOs + M3 HTTP middleware end-to-end against the live API. No crypto, no SRP, no upload/download — just "does our HTTP layer talk to Proton."
-- Added `scripts/js-probe.mjs` (Tier A) — raw Node `fetch` against the same endpoints with the same session, output shape matches `pdtui probe`. Side-by-side diff = correctness signal for M1+M3.
-- `scripts/run-probes.sh` runs both, diffs status/ok, keeps outputs under `$TMPDIR/pdtui-probe-$$/` for inspection.
+## Fixed this pass (QE triage)
 
-This unblocks live validation of M1 + M3 **today** without needing M2 crypto or M3 auth/SRP. Once the user pastes a token and runs the scripts, we know whether the HTTP layer is correct end-to-end.
+- **C1 — signature-verification bypass (CRITICAL):** `decrypt_and_verify`
+  mapped any non-empty `verify_nested` result to `Ok`, including all-`Invalid`
+  vectors. A forged/wrong-signer signature verified as valid. Now inspects
+  `VerificationResult` variants → `SignatureWrongSigner` on present-but-invalid,
+  `NoSignature` on bare payloads. This also hardens the download path: blocks
+  with a bad signature now abort instead of silently passing.
+- **CDN block-URL mangling (blocking):** `request_blob` joined every path
+  against the API base, turning absolute `BareURL`s into
+  `…/api/https://upload.proton.me/…` 404s. Now uses `http(s)://` paths verbatim.
 
-A future "Tier B" — wrapping the actual `@protontech/drive-sdk` from Node — would give crypto-aware ground truth for M4/M5 upload/download. Deferred until M2 has bodies.
+## What's deliberately not done
 
-## What was verifiable end-to-end in this session
-
-1. **Workspace + trait surface** (M0) — reviewers can map every JS `interface/*.ts` to a Rust trait or value object.
-2. **JSON DTO round-trip** (M1) — `ResponseEnvelope<GetUserResponse>` and `GetChildrenResponse` deserialise correctly from fixtures matching Proton's actual response shape (acronym `MIMEType`, envelope `Code`, etc.).
-3. **Passphrase generation** (M2) — 32 random bytes, base64-encoded, 44 chars including padding, RNG roundtrip non-deterministic.
-4. **AEAD rejection** (M2) — `enable_aead_with_encryption_keys: true` returns `CryptoError::AeadNotSupported` as designed by ADR-0006.
-5. **HTTP middleware shape** (M3) — `ReqwestHttpClient::new` constructs, retry/backoff helpers compile and integrate with the SDK trait. Real network calls untested in this session (no test fixture server available; running against live Proton would burn rate budget).
-6. **Local filesystem pane** (M7) — populates from real directories, handles missing paths, sorts parent-first + dirs-before-files, hides dotfiles.
-7. **Keybindings** (M7) — every shortcut in the keymap dispatches to the right action.
-
-## What needs a live account to land
-
-Everything in the **D** rows. The minimum required to unblock them:
-
-1. A captured pcap or HAR of a real Proton Drive session (auth → my-files root → folder listing → small file upload → small file download → events tick).
-2. Or: account credentials and willingness to test against the production API.
-
-With either, M2 crypto bodies can be filled in with the actual byte format Proton expects; M3 auth becomes "match this SRP exchange"; M4/M5/M6 become straightforward ports of the JS modules.
-
-## Quality gates (this session, end state)
-
-- `cargo check --workspace` ✅
-- `cargo clippy --workspace --all-targets -- -D warnings` ✅ (with workspace-wide `unwrap_used`/`expect_used`/`panic` deny)
-- `cargo fmt --all --check` ✅
-- `cargo test --workspace` ✅ **27/27 tests passing**
-- `cargo doc --workspace --no-deps` ✅ no warnings
-- `cargo build --release -p pdtui` ✅ **4.8 MB optimised binary** (reqwest + rustls + pgp deps)
-- CI workflow `.github/workflows/rust.yml` matrices linux + macos
-
-## File touch summary (this session)
-
-```
-docs/
-  PRD-rust-port-and-tui.md       (existing — protobuf note pending)
-  adr/0001-0007 + README + 0000  (created)
-  domain-model.md                (created)
-  IMPLEMENTATION-STATUS.md       (this file)
-
-rust/
-  Cargo.toml                     (deps: pgp, reqwest, serde, rand, base64, ...)
-  crates/proton-drive/           (re-export facade)
-  crates/proton-drive-core/      (trait surface, 13 modules)
-  crates/proton-drive-api/       (JSON DTOs, 20 types)
-  crates/proton-drive-crypto/    (pgp-backed scaffold, passphrase live)
-  crates/proton-drive-cache/     (MemoryCache live, tests)
-  crates/proton-drive-telemetry/ (NullTelemetry)
-  apps/pdtui/
-    src/{main,app,keymap,panes,ui,transfer,auth,http}.rs
-
-.github/workflows/rust.yml       (linux + macos matrix)
-```
+- Full OpenAPI surface — only list/upload/download/events DTOs. Mechanical to extend.
+- Events consumer / live sync — DTOs exist, listing is pull-on-focus for MVP.
+- SEIPDv2 / AEAD — rejected by ADR-0006, deferred to M2.5.
+- SQLite cache — in-memory only, ADR-0003.
 
 ## Honest verdict
 
-Doing M1–M7 in a single conversation as "all green end-to-end" would have required either fabricating code I can't verify or burning many hours against a live Proton account. I chose to ship **what's verifiable** at high quality (25 tests, clippy with deny lints, real local filesystem), **scaffold faithfully** where the JS reference is the source of truth, and **document the gates clearly**. The next session can pick up M2 bodies the moment fixtures are available.
+The MVP is **code-complete and unit/wire-verified end-to-end**, but a first live
+upload will fail at file-create until **B1 (HMAC name hash)** is fixed, which
+needs the parent folder's `NodeHashKey`. That is the single highest-value next
+task. B4 (zeroize passphrases) should land alongside as a security cleanup.
+Everything else is either MVP-scoped-out (B2) or non-blocking polish (B3, B5–B7).
