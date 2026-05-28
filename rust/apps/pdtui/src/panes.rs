@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use proton_drive::NodeUid;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Local,
@@ -15,6 +17,8 @@ pub struct PaneEntry {
     pub is_dir: bool,
     pub size_bytes: Option<u64>,
     pub selected: bool,
+    /// Remote node UID — `Some` only for entries in the remote pane.
+    pub node_uid: Option<NodeUid>,
 }
 
 #[derive(Debug, Default)]
@@ -24,6 +28,9 @@ pub struct Pane {
     pub cursor: usize,
     /// Surfaced to the status bar when set.
     pub error: Option<String>,
+    /// For the remote pane: the NodeUid of the directory currently displayed.
+    /// `None` until authenticated and listed.
+    pub remote_cwd_uid: Option<NodeUid>,
 }
 
 pub struct Panes {
@@ -113,6 +120,40 @@ impl Panes {
             e.selected = !e.selected;
         }
     }
+
+    /// Return the absolute path of the locally selected file.
+    ///
+    /// Returns `None` if the cursor is on a directory or the ".." entry.
+    pub fn selected_local_path(&self) -> Option<PathBuf> {
+        let entry = self.local.entries.get(self.local.cursor)?;
+        if entry.is_dir {
+            return None;
+        }
+        Some(self.local.cwd.join(&entry.name))
+    }
+
+    /// Return `(NodeUid, name)` of the currently selected remote file.
+    ///
+    /// Returns `None` if the cursor is on a directory, the entry has no node
+    /// UID (not yet loaded), or the remote pane has an error.
+    pub fn selected_remote_node(&self) -> Option<(NodeUid, String)> {
+        if self.remote.error.is_some() {
+            return None;
+        }
+        let entry = self.remote.entries.get(self.remote.cursor)?;
+        if entry.is_dir {
+            return None;
+        }
+        let uid = entry.node_uid.clone()?;
+        Some((uid, entry.name.clone()))
+    }
+
+    /// Return the `NodeUid` for the remote folder currently shown.
+    ///
+    /// Returns `None` if the remote pane has not yet been loaded (pre-login).
+    pub fn remote_folder_uid(&self) -> Option<&NodeUid> {
+        self.remote.remote_cwd_uid.as_ref()
+    }
 }
 
 impl Default for Panes {
@@ -159,6 +200,7 @@ fn list_dir(p: &Path) -> std::io::Result<Vec<PaneEntry>> {
             is_dir: true,
             size_bytes: None,
             selected: false,
+            node_uid: None,
         });
     }
     for entry in std::fs::read_dir(p)? {
@@ -176,6 +218,7 @@ fn list_dir(p: &Path) -> std::io::Result<Vec<PaneEntry>> {
             is_dir,
             size_bytes,
             selected: false,
+            node_uid: None,
         });
     }
     Ok(out)

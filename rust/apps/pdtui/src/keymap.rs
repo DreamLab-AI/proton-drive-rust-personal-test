@@ -31,8 +31,8 @@ pub fn dispatch(code: KeyCode, mods: KeyModifiers) -> Action {
         Enter | Char('l') => Action::Enter,
         Backspace | Char('h') => Action::Parent,
         F(5) | Char('r') => Action::Refresh,
-        F(2) | Char('u') => Action::Upload,
-        F(3) | Char('d') => Action::Download,
+        F(3) | Char('u') => Action::Upload,
+        F(2) | Char('d') => Action::Download,
         Char('?') => Action::Help,
         Char(' ') => Action::ToggleSelect,
         _ => Action::None,
@@ -81,9 +81,10 @@ mod tests {
 
     #[test]
     fn function_keys_dispatch_transfers() {
-        assert_eq!(dispatch(KeyCode::F(2), KeyModifiers::NONE), Action::Upload);
+        // Domain-model-mvp.md §Cross-context flows: F3=upload, F2=download.
+        assert_eq!(dispatch(KeyCode::F(3), KeyModifiers::NONE), Action::Upload);
         assert_eq!(
-            dispatch(KeyCode::F(3), KeyModifiers::NONE),
+            dispatch(KeyCode::F(2), KeyModifiers::NONE),
             Action::Download
         );
         assert_eq!(dispatch(KeyCode::F(5), KeyModifiers::NONE), Action::Refresh);

@@ -34,6 +34,7 @@ serde_json.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
 tokio = { workspace = true, features = ["signal", "rt-multi-thread", "macros", "sync", "io-util", "fs"] }
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

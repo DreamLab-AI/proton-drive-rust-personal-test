@@ -4,10 +4,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 
 use crate::app::{LoginField, LoginForm, Screen};
 use crate::panes::{Focus, Pane, Panes};
+use crate::transfer::{Transfer, TransferDirection, TransferState};
 
 pub fn render(
     frame: &mut Frame<'_>,
@@ -15,22 +16,37 @@ pub fn render(
     focus: Focus,
     screen: &Screen,
     status: Option<&str>,
+    transfers: &[Transfer],
 ) {
     let area = frame.area();
+
+    // Compute the height needed for the transfer panel (up to 3 rows each).
+    let transfer_rows = transfers.len().min(3) as u16;
+    // Each transfer: 1 label line + 1 gauge line = 2 rows, plus a 1-row heading.
+    let transfer_height = if transfers.is_empty() {
+        0
+    } else {
+        1 + transfer_rows * 2
+    };
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1),               // header
+            Constraint::Min(1),                  // panes
+            Constraint::Length(transfer_height), // transfer panel
+            Constraint::Length(1),               // status
+            Constraint::Length(1),               // key bar
         ])
         .split(area);
 
     render_header(frame, layout[0]);
     render_panes(frame, layout[1], panes, focus);
-    render_status(frame, layout[2], status);
-    render_keybar(frame, layout[3], screen);
+    if !transfers.is_empty() {
+        render_transfers(frame, layout[2], transfers);
+    }
+    render_status(frame, layout[3], status);
+    render_keybar(frame, layout[4], screen);
 
     // Login / auth overlay renders on top of everything else.
     match screen {
@@ -98,6 +114,95 @@ fn render_pane(frame: &mut Frame<'_>, area: Rect, pane: &Pane, label: &str, focu
     frame.render_widget(list, area);
 }
 
+// ---------------------------------------------------------------------------
+// Transfer panel
+// ---------------------------------------------------------------------------
+
+fn render_transfers(frame: &mut Frame<'_>, area: Rect, transfers: &[Transfer]) {
+    if area.height == 0 {
+        return;
+    }
+
+    // Heading row.
+    let heading = Paragraph::new(" Transfers").style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(heading, Rect { height: 1, ..area });
+
+    // Render up to 3 transfers, each taking 2 rows.
+    let visible: Vec<&Transfer> = transfers.iter().rev().take(3).collect();
+    for (i, t) in visible.iter().enumerate() {
+        let row_y = area.y + 1 + (i as u16) * 2;
+        if row_y + 1 >= area.y + area.height {
+            break;
+        }
+        let label_area = Rect {
+            x: area.x,
+            y: row_y,
+            width: area.width,
+            height: 1,
+        };
+        let gauge_area = Rect {
+            x: area.x,
+            y: row_y + 1,
+            width: area.width,
+            height: 1,
+        };
+        render_transfer_row(frame, label_area, gauge_area, t);
+    }
+}
+
+fn render_transfer_row(frame: &mut Frame<'_>, label_area: Rect, gauge_area: Rect, t: &Transfer) {
+    let dir_icon = match t.direction {
+        TransferDirection::Upload => "↑",
+        TransferDirection::Download => "↓",
+    };
+
+    let state_text = match &t.state {
+        TransferState::Pending => "pending".to_owned(),
+        TransferState::Running => {
+            let pct = (t.progress.fraction() * 100.0) as u64;
+            let done = human_bytes(t.progress.bytes_done);
+            match t.progress.bytes_total {
+                Some(total) => format!("{}%  {} / {}", pct, done, human_bytes(total)),
+                None => format!("{}  transferring…", done),
+            }
+        }
+        TransferState::Completed => "completed".to_owned(),
+        TransferState::Cancelled => "cancelled".to_owned(),
+        TransferState::Failed(msg) => format!("failed: {msg}"),
+    };
+
+    let label_style = match &t.state {
+        TransferState::Completed => Style::default().fg(Color::Green),
+        TransferState::Failed(_) => Style::default().fg(Color::Red),
+        TransferState::Cancelled => Style::default().fg(Color::DarkGray),
+        _ => Style::default(),
+    };
+
+    let label_line = format!(" {dir_icon} {}  {state_text}", t.label);
+    frame.render_widget(
+        Paragraph::new(Span::styled(label_line, label_style)),
+        label_area,
+    );
+
+    // Gauge — filled only while running; terminal states show full/empty bar.
+    let ratio = match &t.state {
+        TransferState::Completed => 1.0,
+        TransferState::Cancelled | TransferState::Failed(_) => 0.0,
+        _ => t.progress.fraction(),
+    };
+
+    let gauge_style = match &t.state {
+        TransferState::Completed => Style::default().fg(Color::Green),
+        TransferState::Failed(_) => Style::default().fg(Color::Red),
+        TransferState::Cancelled => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::Cyan),
+    };
+
+    let gauge = Gauge::default().gauge_style(gauge_style).ratio(ratio);
+
+    frame.render_widget(gauge, gauge_area);
+}
+
 fn render_status(frame: &mut Frame<'_>, area: Rect, status: Option<&str>) {
     let text = status.unwrap_or(" idle");
     frame.render_widget(Paragraph::new(text), area);
@@ -106,8 +211,8 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, status: Option<&str>) {
 fn render_keybar(frame: &mut Frame<'_>, area: Rect, screen: &Screen) {
     let text = match screen {
         Screen::Login(_) => " Tab next field   Enter submit   Esc cancel",
-        Screen::Authenticating(_) => " Authenticating…   Esc cancel",
-        Screen::Main => " F4 login   F2 upload   F3 download   F5 refresh   Tab switch   q quit",
+        Screen::Authenticating(_) => " Authenticating...   Esc cancel",
+        Screen::Main => " F4 login   F3 upload   F2 download   F5 refresh   Tab switch   q quit",
     };
     frame.render_widget(Paragraph::new(text), area);
 }
@@ -124,7 +229,7 @@ fn render_login_overlay(frame: &mut Frame<'_>, area: Rect, form: &LoginForm, aut
     frame.render_widget(Clear, popup);
 
     let title = if authenticating {
-        " Authenticating… "
+        " Authenticating... "
     } else {
         " Login — Proton Drive "
     };
@@ -179,10 +284,10 @@ fn render_login_overlay(frame: &mut Frame<'_>, area: Rect, form: &LoginForm, aut
     ];
 
     if authenticating {
-        lines.push(Line::raw("  Authenticating, please wait…"));
+        lines.push(Line::raw("  Authenticating, please wait..."));
     } else if let Some(err) = &form.error {
         lines.push(Line::from(Span::styled(
-            format!("  ✗ {err}"),
+            format!("  {err}"),
             Style::default().fg(Color::Red),
         )));
     } else {
