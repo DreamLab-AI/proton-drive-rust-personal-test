@@ -66,13 +66,8 @@ impl PdtuiAccount {
         debug!(count = addr_resp.addresses.len(), "fetched addresses");
 
         // Cascading key unlock: try direct, then token-based, until fixpoint.
-        let (user_keys, address_keys) = cascade_unlock(
-            &*crypto,
-            &user,
-            &addr_resp.addresses,
-            &key_password,
-        )
-        .await?;
+        let (user_keys, address_keys) =
+            cascade_unlock(&*crypto, &user, &addr_resp.addresses, &key_password).await?;
 
         debug!(
             user_keys = user_keys.len(),
@@ -147,15 +142,17 @@ async fn cascade_unlock(
     addresses: &[Address],
     key_password: &str,
 ) -> Result<(Vec<PrivateKey>, HashMap<String, PrivateKey>)> {
-    // Pool of all unlocked keys (used to decrypt Tokens in subsequent rounds).
-    let mut pool: Vec<PrivateKey> = Vec::new();
-
-    let mut unlocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    /// Where an unlocked key should be filed once recovered.
+    enum Dest {
+        User,
+        Address(String),
+    }
 
     struct Pending {
         id: String,
         armored: String,
         token: Option<String>,
+        dest: Dest,
     }
 
     let mut pending: Vec<Pending> = Vec::new();
@@ -164,6 +161,7 @@ async fn cascade_unlock(
             id: uk.id.clone(),
             armored: uk.private_key.clone(),
             token: uk.token.clone(),
+            dest: Dest::User,
         });
     }
     for addr in addresses {
@@ -177,36 +175,52 @@ async fn cascade_unlock(
                 id: ak.id.clone(),
                 armored: ak.private_key.clone(),
                 token: ak.token.clone(),
+                dest: Dest::Address(addr.email.to_ascii_lowercase()),
             });
         }
     }
 
-    // Round 1: try direct unlock with key_password.
+    // Pool of unlocked keys, used to decrypt Tokens in subsequent rounds.
+    let mut pool: Vec<PrivateKey> = Vec::new();
+    let mut user_keys: Vec<PrivateKey> = Vec::new();
+    let mut address_keys: HashMap<String, PrivateKey> = HashMap::new();
+
+    // Helper: file an unlocked key into its destination and the shared pool.
+    fn file(
+        dest: &Dest,
+        key: PrivateKey,
+        pool: &mut Vec<PrivateKey>,
+        user_keys: &mut Vec<PrivateKey>,
+        address_keys: &mut HashMap<String, PrivateKey>,
+    ) {
+        pool.push(key.clone());
+        match dest {
+            Dest::User => user_keys.push(key),
+            Dest::Address(email) => {
+                address_keys.insert(email.clone(), key);
+            }
+        }
+    }
+
+    // Round 1: direct unlock with the mailbox password.
     let mut still_pending = Vec::new();
     for p in pending {
         match crypto.decrypt_key(&p.armored, key_password).await {
             Ok(key) => {
                 debug!(key_id = %p.id, "direct unlock ok");
-                unlocked_ids.insert(p.id.clone());
-                pool.push(key);
+                file(&p.dest, key, &mut pool, &mut user_keys, &mut address_keys);
             }
             Err(_) => still_pending.push(p),
         }
     }
     pending = still_pending;
 
-    // Rounds 2+: token-based unlock using the pool.
-    loop {
-        if pending.is_empty() || pool.is_empty() {
-            break;
-        }
+    // Rounds 2+: token-based unlock using the pool, to a fixpoint.
+    while !pending.is_empty() && !pool.is_empty() {
         let mut progress = false;
         let mut next_pending = Vec::new();
 
         for p in pending {
-            if unlocked_ids.contains(&p.id) {
-                continue;
-            }
             let Some(ref token_armored) = p.token else {
                 debug!(key_id = %p.id, "no token, cannot unlock via cascade");
                 next_pending.push(p);
@@ -215,8 +229,7 @@ async fn cascade_unlock(
             match decrypt_token_and_unlock(crypto, token_armored, &p.armored, &pool).await {
                 Ok(key) => {
                     debug!(key_id = %p.id, "token-based unlock ok");
-                    unlocked_ids.insert(p.id.clone());
-                    pool.push(key);
+                    file(&p.dest, key, &mut pool, &mut user_keys, &mut address_keys);
                     progress = true;
                 }
                 Err(e) => {
@@ -236,35 +249,6 @@ async fn cascade_unlock(
         warn!(key_id = %p.id, "could not unlock key");
     }
 
-    // Partition unlocked keys into user keys and address keys.
-    // Re-derive from pool using the pending metadata we kept track of.
-    let mut user_keys = Vec::new();
-    let mut address_keys: HashMap<String, PrivateKey> = HashMap::new();
-
-    // We need to know which pool entry corresponds to which dest. Since pool
-    // was built in order, reconstruct by re-trying each original key.
-    for uk in &user.keys {
-        if unlocked_ids.contains(&uk.id) {
-            if let Ok(key) = try_unlock(crypto, &uk.private_key, uk.token.as_deref(), key_password, &pool).await {
-                user_keys.push(key);
-            }
-        }
-    }
-    for addr in addresses {
-        let ak = addr
-            .keys
-            .iter()
-            .find(|k| k.primary == 1)
-            .or_else(|| addr.keys.first());
-        if let Some(ak) = ak {
-            if unlocked_ids.contains(&ak.id) {
-                if let Ok(key) = try_unlock(crypto, &ak.private_key, ak.token.as_deref(), key_password, &pool).await {
-                    address_keys.insert(addr.email.to_ascii_lowercase(), key);
-                }
-            }
-        }
-    }
-
     if user_keys.is_empty() && address_keys.is_empty() {
         return Err(Error::Decryption(
             "no keys could be unlocked (tried direct + token-based cascade)".to_owned(),
@@ -272,23 +256,6 @@ async fn cascade_unlock(
     }
 
     Ok((user_keys, address_keys))
-}
-
-/// Try to unlock a key: first direct with key_password, then via token.
-async fn try_unlock(
-    crypto: &dyn OpenPgpCrypto,
-    armored: &str,
-    token: Option<&str>,
-    key_password: &str,
-    pool: &[PrivateKey],
-) -> Result<PrivateKey> {
-    if let Ok(key) = crypto.decrypt_key(armored, key_password).await {
-        return Ok(key);
-    }
-    if let Some(tok) = token {
-        return decrypt_token_and_unlock(crypto, tok, armored, pool).await;
-    }
-    Err(Error::Decryption("key could not be unlocked".into()))
 }
 
 /// Decrypt a Token with any key in `pool`, yielding the per-key passphrase,
@@ -310,11 +277,15 @@ async fn decrypt_token_and_unlock(
         .await
         .map_err(|e| Error::Decryption(format!("token plaintext: {e}")))?;
 
-    let passphrase = std::str::from_utf8(&passphrase_bytes)
+    // The recovered per-key passphrase is secret material: wrap it so the heap
+    // buffer is wiped on drop (ADR-0011), and validate UTF-8 without leaking a
+    // second un-zeroized copy.
+    let passphrase = Zeroizing::new(passphrase_bytes);
+    let passphrase_str = std::str::from_utf8(&passphrase)
         .map_err(|e| Error::Internal(format!("token passphrase not utf-8: {e}")))?;
 
     crypto
-        .decrypt_key(key_armored, passphrase)
+        .decrypt_key(key_armored, passphrase_str)
         .await
         .map_err(|e| Error::Decryption(format!("unlock key: {e}")))
 }

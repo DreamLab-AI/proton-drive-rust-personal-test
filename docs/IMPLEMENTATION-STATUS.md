@@ -38,7 +38,7 @@ work against production today".
 | B1 | Name hash is `SHA256(name)`, not `HMAC-SHA256(NodeHashKey, name)` | `upload.rs:~330` (FIXME) | Server 422 on file create — needs parent `FolderProperties.NodeHashKey` decrypted | **Blocking upload** |
 | B2 | Nested-folder key derivation deferred | `download.rs` `decrypt_node_private_key` works for share-root children only | Files outside MyFiles root can't derive node key | High (MVP = root files) |
 | B3 | XAttr modification-time decrypt is a TODO; size-mismatch logs, not fatal | `download.rs:~355`, `~393` | Restored mtime not applied; corrupted-size XAttr not caught | Medium |
-| B4 | Recovered address-key + node passphrases held as plain `String`/`Vec<u8>` | `account.rs:~206`, `download.rs:~540` | Secret material not zeroized on drop (violates ADR-0011 spirit) | Medium (security) |
+| ~~B4~~ | ~~Recovered passphrases held as plain `Vec<u8>`~~ | ~~`account.rs`~~ | **Fixed** — `decrypt_token_and_unlock` now wraps recovered passphrases in `Zeroizing`; `key_password` already `Zeroizing`. `download.rs` node passphrase still to audit | Done (account); Medium (download node passphrase) |
 | B5 | Detached per-block `enc_signature` fetched but not independently verified | `download.rs` | Inline block signature *is* verified (see C1 fix); detached sig is not a second gate | Low (manifest + inline cover integrity) |
 | B6 | Download partial-write leaves a truncated file on mid-stream failure | `download.rs:~148` | No cleanup of the caller's writer on error | Low |
 | B7 | Dead `decrypt_node_key` public stub returns `NotImplemented` | `download.rs:517` | Confusing API surface; real path is `decrypt_node_private_key` | Trivial (delete) |
