@@ -123,7 +123,9 @@ pub mod shares {
         pub key: String,
         pub passphrase: String,
         pub passphrase_signature: String,
+        #[serde(rename = "AddressID")]
         pub address_id: String,
+        #[serde(rename = "AddressKeyID")]
         pub address_key_id: String,
     }
 }
@@ -275,6 +277,7 @@ pub mod upload {
     #[serde(rename_all = "PascalCase")]
     pub struct UploadLink {
         pub index: u32,
+        #[serde(rename = "BareURL")]
         pub bare_url: String,
         pub token: String,
     }
@@ -291,9 +294,13 @@ pub mod upload {
 pub mod download {
     use super::*;
 
+    /// Response from `GET drive/v2/volumes/{VolumeID}/files/{linkID}/revisions/{revisionID}`.
+    ///
+    /// Mirrors `GetRevisionResponse` in `js/sdk/src/internal/download/apiService.ts`.
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct GetRevisionResponse {
+        #[serde(rename = "Revision")]
         pub revision: RevisionWithBlocks,
     }
 
@@ -302,19 +309,40 @@ pub mod download {
     pub struct RevisionWithBlocks {
         #[serde(rename = "ID")]
         pub id: String,
-        pub blocks: Vec<Block>,
+        /// Revision state: 1 = active, 2 = draft, 3 = superseded.
+        pub state: Option<u8>,
+        pub blocks: Vec<BlockResponse>,
         pub manifest_signature: Option<String>,
+        /// Armored PKESK packet: wraps the content session key for the node key.
+        pub content_key_packet: Option<String>,
+        pub content_key_packet_signature: Option<String>,
+        /// Encrypted extended attributes (modification time, size, SHA1 digest).
+        /// May be absent for legacy revisions.
+        pub x_attr: Option<String>,
+        /// Email of the address that signed this revision's content.
         pub signature_email: Option<String>,
     }
 
+    /// A single block within a revision.
+    ///
+    /// `Hash` is the base64-encoded SHA-256 of the **ciphertext** (not plaintext).
+    /// As noted in `domain-model-mvp.md`: "Hash is sha256 of ciphertext, not plaintext."
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "PascalCase")]
-    pub struct Block {
+    pub struct BlockResponse {
+        /// 1-based block index within the revision.
         pub index: u32,
+        /// Opaque CDN URL — treated as a blob, never parsed (domain-model anti-corruption rule).
+        /// The API uses uppercase "URL" suffix, not "Url".
+        #[serde(rename = "BareURL")]
         pub bare_url: String,
+        /// Bearer token for the `Authorization` header when fetching `bare_url`.
         pub token: String,
+        /// Base64-encoded SHA-256 of the ciphertext bytes.
         pub hash: String,
+        /// Encrypted detached signature for this block (optional for legacy revisions).
         pub encrypted_signature: Option<String>,
+        /// Ciphertext size in bytes.
         pub size: u64,
     }
 }

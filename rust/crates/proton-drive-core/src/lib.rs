@@ -28,7 +28,7 @@ pub mod upload;
 pub use account::{Author, ProtonDriveAccount};
 pub use client::{ProtonDriveClient, ProtonDriveClientOptions};
 pub use config::ProtonDriveConfig;
-pub use download::{DownloadController, FileDownloader};
+pub use download::{DownloadStats, FileDownloader};
 pub use error::{Error, Result};
 pub use events::{DriveEvent, DriveListener, EventSubscription};
 pub use http::ProtonDriveHttpClient;
@@ -36,4 +36,4 @@ pub use nodes::{
     CachedCryptoMaterial, FolderChildrenFilter, MaybeNode, Node, NodeType, NodeUid, Revision,
     make_node_uid,
 };
-pub use upload::{FileUploader, UploadController, UploadMetadata};
+pub use upload::{FileUploader, ProtonFileUploader, UploadController, UploadMetadata};
