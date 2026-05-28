@@ -4,18 +4,20 @@
 //! # Key-unlock chain
 //!
 //! Login (`auth.rs`) yields a bcrypt-derived mailbox password (`$2y$10…`).
-//! Resolving an address's private key follows the Proton key hierarchy:
+//! Resolving private keys uses a cascading unlock:
 //!
-//! 1. `GET /core/v4/users` → `User.Keys[]`. Each armored `PrivateKey` is
-//!    unlocked **directly** with the mailbox password.
-//! 2. `GET /core/v4/addresses` → `Addresses[].Keys[]`. Each address key has a
-//!    `Token` (an armored PGP message) encrypted to one of the user keys.
-//!    Decrypting the Token with an unlocked user key yields the address-key
-//!    passphrase, which in turn unlocks the address `PrivateKey`.
-//! 3. The unlocked address keys are cached by email.
+//! 1. Try every user key and address key directly with the mailbox password.
+//! 2. For any key that has a `Token` (armored PGP message) but didn't unlock
+//!    directly, decrypt the Token with an already-unlocked key — the plaintext
+//!    is the per-key passphrase.
+//! 3. Repeat step 2 until no new keys unlock (fixpoint).
+//!
+//! On **legacy** accounts the user key unlocks directly (step 1). On **modern**
+//! (post-migration) accounts the address key unlocks directly and the user key
+//! has a Token that requires the address key (step 2).
 //!
 //! Token signature verification against the SignedKeyList is **deferred** for
-//! MVP — we decrypt only (see step 2 below).
+//! MVP — we decrypt only.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,37 +58,27 @@ impl PdtuiAccount {
         user_id: String,
         key_password: Zeroizing<String>,
     ) -> Result<Self> {
-        // Step 1: fetch user keys and unlock each directly with the mailbox
-        // password.
         let user_resp: GetUserResponse = api_get(&*http, "/core/v4/users").await?;
         let user = user_resp.user;
         debug!(user_id = %user.id, key_count = user.keys.len(), "fetched user keys");
 
-        let user_keys = unlock_user_keys(&*crypto, &user, &key_password).await?;
-        if user_keys.is_empty() {
-            return Err(Error::Decryption(
-                "no user key could be unlocked with the mailbox password".to_owned(),
-            ));
-        }
-
-        // Step 2: fetch addresses and unlock each address key via its Token.
         let addr_resp: GetAddressesResponse = api_get(&*http, "/core/v4/addresses").await?;
         debug!(count = addr_resp.addresses.len(), "fetched addresses");
 
-        let mut address_keys: HashMap<String, PrivateKey> = HashMap::new();
-        for address in &addr_resp.addresses {
-            match unlock_address_key(&*crypto, address, &user_keys).await {
-                Ok(key) => {
-                    address_keys.insert(address.email.to_ascii_lowercase(), key);
-                }
-                Err(e) => {
-                    // A user may have addresses we cannot unlock (disabled,
-                    // external, legacy layouts). Skip them rather than abort —
-                    // we only need the primary address for MVP.
-                    warn!(email = %address.email, "skipping address: {e}");
-                }
-            }
-        }
+        // Cascading key unlock: try direct, then token-based, until fixpoint.
+        let (user_keys, address_keys) = cascade_unlock(
+            &*crypto,
+            &user,
+            &addr_resp.addresses,
+            &key_password,
+        )
+        .await?;
+
+        debug!(
+            user_keys = user_keys.len(),
+            address_keys = address_keys.len(),
+            "cascade unlock complete"
+        );
 
         if address_keys.is_empty() {
             return Err(Error::Decryption(
@@ -138,78 +130,193 @@ impl ProtonDriveAccount for PdtuiAccount {
 }
 
 // ---------------------------------------------------------------------------
-// Key-unlock helpers
+// Cascading key unlock
 // ---------------------------------------------------------------------------
 
-/// Unlock every user key directly with the mailbox password. Keys that fail to
-/// unlock (e.g. hardware-backed) are skipped.
-async fn unlock_user_keys(
+/// Unlock all user and address keys via a cascading strategy:
+///
+/// 1. Try every key directly with key_password.
+/// 2. For Token-bearing keys that didn't unlock, decrypt the Token with any
+///    already-unlocked key to recover the per-key passphrase.
+/// 3. Repeat until no new keys unlock.
+///
+/// Returns `(user_keys, address_keys_by_email)`.
+async fn cascade_unlock(
     crypto: &dyn OpenPgpCrypto,
     user: &User,
+    addresses: &[Address],
     key_password: &str,
-) -> Result<Vec<PrivateKey>> {
-    let mut out = Vec::new();
-    for key in &user.keys {
-        match crypto.decrypt_key(&key.private_key, key_password).await {
-            Ok(unlocked) => out.push(unlocked),
-            Err(e) => warn!(key_id = %key.id, "user key did not unlock: {e}"),
+) -> Result<(Vec<PrivateKey>, HashMap<String, PrivateKey>)> {
+    // Pool of all unlocked keys (used to decrypt Tokens in subsequent rounds).
+    let mut pool: Vec<PrivateKey> = Vec::new();
+
+    let mut unlocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    struct Pending {
+        id: String,
+        armored: String,
+        token: Option<String>,
+    }
+
+    let mut pending: Vec<Pending> = Vec::new();
+    for uk in &user.keys {
+        pending.push(Pending {
+            id: uk.id.clone(),
+            armored: uk.private_key.clone(),
+            token: uk.token.clone(),
+        });
+    }
+    for addr in addresses {
+        let ak = addr
+            .keys
+            .iter()
+            .find(|k| k.primary == 1)
+            .or_else(|| addr.keys.first());
+        if let Some(ak) = ak {
+            pending.push(Pending {
+                id: ak.id.clone(),
+                armored: ak.private_key.clone(),
+                token: ak.token.clone(),
+            });
         }
     }
-    Ok(out)
+
+    // Round 1: try direct unlock with key_password.
+    let mut still_pending = Vec::new();
+    for p in pending {
+        match crypto.decrypt_key(&p.armored, key_password).await {
+            Ok(key) => {
+                debug!(key_id = %p.id, "direct unlock ok");
+                unlocked_ids.insert(p.id.clone());
+                pool.push(key);
+            }
+            Err(_) => still_pending.push(p),
+        }
+    }
+    pending = still_pending;
+
+    // Rounds 2+: token-based unlock using the pool.
+    loop {
+        if pending.is_empty() || pool.is_empty() {
+            break;
+        }
+        let mut progress = false;
+        let mut next_pending = Vec::new();
+
+        for p in pending {
+            if unlocked_ids.contains(&p.id) {
+                continue;
+            }
+            let Some(ref token_armored) = p.token else {
+                debug!(key_id = %p.id, "no token, cannot unlock via cascade");
+                next_pending.push(p);
+                continue;
+            };
+            match decrypt_token_and_unlock(crypto, token_armored, &p.armored, &pool).await {
+                Ok(key) => {
+                    debug!(key_id = %p.id, "token-based unlock ok");
+                    unlocked_ids.insert(p.id.clone());
+                    pool.push(key);
+                    progress = true;
+                }
+                Err(e) => {
+                    debug!(key_id = %p.id, "token unlock failed: {e}");
+                    next_pending.push(p);
+                }
+            }
+        }
+
+        pending = next_pending;
+        if !progress {
+            break;
+        }
+    }
+
+    for p in &pending {
+        warn!(key_id = %p.id, "could not unlock key");
+    }
+
+    // Partition unlocked keys into user keys and address keys.
+    // Re-derive from pool using the pending metadata we kept track of.
+    let mut user_keys = Vec::new();
+    let mut address_keys: HashMap<String, PrivateKey> = HashMap::new();
+
+    // We need to know which pool entry corresponds to which dest. Since pool
+    // was built in order, reconstruct by re-trying each original key.
+    for uk in &user.keys {
+        if unlocked_ids.contains(&uk.id) {
+            if let Ok(key) = try_unlock(crypto, &uk.private_key, uk.token.as_deref(), key_password, &pool).await {
+                user_keys.push(key);
+            }
+        }
+    }
+    for addr in addresses {
+        let ak = addr
+            .keys
+            .iter()
+            .find(|k| k.primary == 1)
+            .or_else(|| addr.keys.first());
+        if let Some(ak) = ak {
+            if unlocked_ids.contains(&ak.id) {
+                if let Ok(key) = try_unlock(crypto, &ak.private_key, ak.token.as_deref(), key_password, &pool).await {
+                    address_keys.insert(addr.email.to_ascii_lowercase(), key);
+                }
+            }
+        }
+    }
+
+    if user_keys.is_empty() && address_keys.is_empty() {
+        return Err(Error::Decryption(
+            "no keys could be unlocked (tried direct + token-based cascade)".to_owned(),
+        ));
+    }
+
+    Ok((user_keys, address_keys))
 }
 
-/// Unlock one address's primary private key.
-///
-/// The address key `Token` is an armored PGP message encrypted to one of the
-/// user keys; its plaintext is the passphrase that unlocks the address
-/// `PrivateKey`.
-///
-/// Token signature verification against the SignedKeyList is deferred for MVP
-/// — we decrypt only.
-async fn unlock_address_key(
+/// Try to unlock a key: first direct with key_password, then via token.
+async fn try_unlock(
     crypto: &dyn OpenPgpCrypto,
-    address: &Address,
-    user_keys: &[PrivateKey],
+    armored: &str,
+    token: Option<&str>,
+    key_password: &str,
+    pool: &[PrivateKey],
 ) -> Result<PrivateKey> {
-    // Prefer the primary address key; fall back to the first.
-    let addr_key = address
-        .keys
-        .iter()
-        .find(|k| k.primary == 1)
-        .or_else(|| address.keys.first())
-        .ok_or_else(|| Error::Internal(format!("address {} has no keys", address.email)))?;
+    if let Ok(key) = crypto.decrypt_key(armored, key_password).await {
+        return Ok(key);
+    }
+    if let Some(tok) = token {
+        return decrypt_token_and_unlock(crypto, tok, armored, pool).await;
+    }
+    Err(Error::Decryption("key could not be unlocked".into()))
+}
 
-    let token = addr_key.token.as_deref().ok_or_else(|| {
-        Error::Decryption(format!(
-            "address {} key {} has no Token (unsupported key layout)",
-            address.email, addr_key.id
-        ))
-    })?;
+/// Decrypt a Token with any key in `pool`, yielding the per-key passphrase,
+/// then unlock the target key.
+async fn decrypt_token_and_unlock(
+    crypto: &dyn OpenPgpCrypto,
+    token_armored: &str,
+    key_armored: &str,
+    pool: &[PrivateKey],
+) -> Result<PrivateKey> {
+    let token_bytes = dearmor_pgp(token_armored)?;
 
-    // The Token is an ASCII-armored PGP message. `decrypt_session_key` parses
-    // raw binary packets (it does not de-armor), so convert to binary first.
-    // `decrypt_and_verify` de-armors internally, but we feed it the same binary
-    // for consistency.
-    let token_bytes = dearmor_pgp(token)?;
-
-    // Recover the session key from the Token's PKESK using any user key, then
-    // decrypt the SEIPD body — the plaintext IS the address-key passphrase.
     let session_key = crypto
-        .decrypt_session_key(&token_bytes, user_keys)
+        .decrypt_session_key(&token_bytes, pool)
         .await
-        .map_err(|e| Error::Decryption(format!("address token session key: {e}")))?;
-    let (passphrase_bytes, _status) = crypto
+        .map_err(|e| Error::Decryption(format!("token session key: {e}")))?;
+    let (passphrase_bytes, _) = crypto
         .decrypt_and_verify(&token_bytes, &session_key, &[])
         .await
-        .map_err(|e| Error::Decryption(format!("address token plaintext: {e}")))?;
+        .map_err(|e| Error::Decryption(format!("token plaintext: {e}")))?;
 
     let passphrase = std::str::from_utf8(&passphrase_bytes)
-        .map_err(|e| Error::Internal(format!("address passphrase not utf-8: {e}")))?;
+        .map_err(|e| Error::Internal(format!("token passphrase not utf-8: {e}")))?;
 
     crypto
-        .decrypt_key(&addr_key.private_key, passphrase)
+        .decrypt_key(key_armored, passphrase)
         .await
-        .map_err(|e| Error::Decryption(format!("unlock address private key: {e}")))
+        .map_err(|e| Error::Decryption(format!("unlock key: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -539,7 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_fails_when_user_key_does_not_unlock() {
+    async fn bootstrap_fails_when_no_key_unlocks() {
         let crypto = RpgpCrypto::new();
         let (user_priv, _) = crypto
             .generate_key("correct-password", EncryptOptions::default())
@@ -557,8 +664,16 @@ mod tests {
         })
         .to_string();
 
-        let http = Arc::new(PathMock::new(vec![("/core/v4/users", users_body)]))
-            as Arc<dyn ProtonDriveHttpClient>;
+        let addresses_body = serde_json::json!({
+            "Code": 1000,
+            "Addresses": []
+        })
+        .to_string();
+
+        let http = Arc::new(PathMock::new(vec![
+            ("/core/v4/users", users_body),
+            ("/core/v4/addresses", addresses_body),
+        ])) as Arc<dyn ProtonDriveHttpClient>;
         let crypto_arc = Arc::new(RpgpCrypto::new()) as Arc<dyn OpenPgpCrypto>;
 
         let result = PdtuiAccount::bootstrap(
@@ -572,6 +687,89 @@ mod tests {
             result.is_err(),
             "wrong mailbox password must fail bootstrap"
         );
+    }
+
+    /// Modern account layout: user key has a Token, address key unlocks
+    /// directly with key_password. Bootstrap cascades: address key first,
+    /// then user key via Token.
+    #[tokio::test]
+    async fn bootstrap_cascades_address_to_user_key() {
+        let crypto = RpgpCrypto::new();
+        let mailbox_pw = "$2y$10$cascadetest";
+
+        // Address key — unlocks directly with mailbox password.
+        let (addr_priv, addr_pub_armored) = crypto
+            .generate_key(mailbox_pw, EncryptOptions::default())
+            .await
+            .unwrap();
+        let addr_pub = PublicKey {
+            armored: addr_pub_armored,
+            fingerprint_hex: addr_priv.fingerprint_hex.clone(),
+        };
+
+        // User key — locked with a DIFFERENT passphrase.
+        let user_passphrase = "user-key-internal-passphrase";
+        let (user_priv, _) = crypto
+            .generate_key(user_passphrase, EncryptOptions::default())
+            .await
+            .unwrap();
+
+        // User key Token = user_passphrase encrypted to the address key.
+        let user_token_bytes =
+            make_token(&crypto, &addr_pub, &addr_priv, user_passphrase.as_bytes()).await;
+        let user_token_armored = armor_message(&user_token_bytes);
+
+        let users_body = serde_json::json!({
+            "Code": 1000,
+            "User": {
+                "ID": "user-456",
+                "Name": "modern",
+                "Email": "modern@proton.me",
+                "Keys": [{
+                    "ID": "uk1",
+                    "Primary": 1,
+                    "PrivateKey": user_priv.armored,
+                    "Token": user_token_armored
+                }]
+            }
+        })
+        .to_string();
+
+        let addresses_body = serde_json::json!({
+            "Code": 1000,
+            "Addresses": [{
+                "ID": "addr-1",
+                "Email": "modern@proton.me",
+                "Order": 1,
+                "Keys": [{
+                    "ID": "ak1",
+                    "Primary": 1,
+                    "PrivateKey": addr_priv.armored
+                }]
+            }]
+        })
+        .to_string();
+
+        let http = Arc::new(PathMock::new(vec![
+            ("/core/v4/users", users_body),
+            ("/core/v4/addresses", addresses_body),
+        ])) as Arc<dyn ProtonDriveHttpClient>;
+        let crypto_arc = Arc::new(RpgpCrypto::new()) as Arc<dyn OpenPgpCrypto>;
+
+        let account = PdtuiAccount::bootstrap(
+            http,
+            crypto_arc,
+            "user-456".to_owned(),
+            Zeroizing::new(mailbox_pw.to_owned()),
+        )
+        .await
+        .expect("cascade bootstrap should succeed");
+
+        assert_eq!(account.primary_email(), "modern@proton.me");
+        account
+            .address_private_key("modern@proton.me")
+            .await
+            .expect("address key resolves");
     }
 
     // -----------------------------------------------------------------------

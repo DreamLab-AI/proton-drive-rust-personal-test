@@ -59,6 +59,11 @@ pub mod user {
         pub id: String,
         pub primary: u8,
         pub private_key: String,
+        /// On modern accounts the user key is locked with a per-key passphrase
+        /// stored in this Token (armored PGP message encrypted to another key).
+        /// `None` on legacy accounts where key_password unlocks directly.
+        #[serde(default)]
+        pub token: Option<String>,
     }
 }
 
