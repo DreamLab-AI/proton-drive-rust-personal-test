@@ -6,8 +6,6 @@
 //! - surface 429 as `Error::RateLimited` honouring `Retry-After`
 //! - never proxy endpoints (constructor pins the base URL)
 
-#![allow(dead_code)] // wired into App in M3 once auth lands
-
 use std::time::Duration;
 
 use async_trait::async_trait;

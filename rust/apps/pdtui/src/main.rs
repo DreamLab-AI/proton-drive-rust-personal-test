@@ -40,6 +40,7 @@ async fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("login") => run_login().await,
         Some("probe") => run_probe().await,
         Some("where") => {
             println!("{}", session::Session::config_path().display());
@@ -64,17 +65,30 @@ fn print_help() {
 
 USAGE:
     pdtui                 launch the TUI
+    pdtui login           authenticate via SRP and persist session
     pdtui probe           run live-API diagnostic probes (M1 + M3 e2e)
     pdtui where           print where the session config file should live
     pdtui help            show this help
 
 CONFIG:
     Session: $XDG_CONFIG_HOME/pdtui/session.json (or ~/.config/pdtui/session.json)
-    Format:  {{\"AccessToken\": \"...\", \"UID\": \"...\"}}
+    Keyring: OS secret-service (Linux) / Keychain (macOS) under service 'pdtui-proton-drive'
     Logs:    set PDTUI_LOG=debug for verbose output
 ",
         version = proton_drive::VERSION
     );
+}
+
+async fn run_login() -> ExitCode {
+    let base_url = "https://drive.proton.me/api";
+    let app_version = format!("external-drive-pdtui@{}-stable", proton_drive::VERSION);
+    match auth::login_interactive(base_url, &app_version).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("login failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 async fn run_probe() -> ExitCode {

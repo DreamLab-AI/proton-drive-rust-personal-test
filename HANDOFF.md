@@ -63,7 +63,7 @@ Skills/agents already wired into the user's setup:
 - `agentic-qe` (broken in container, working on host — try it on Linux)
 - ruflo / ruvector swarm tools (`mcp__ruvector__*`)
 
-There is an active mesh swarm from the prior session: ID `swarm_1779915934241_4kdqcse`. Five agents spawned (`m1-protobuf-codegen`, `m2-rpgp-impl`, `m3-http-account`, `tui-wiring`, `qe-reviewer`). `m1-protobuf-codegen` is **stale** — protobuf was the wrong target (see `IMPLEMENTATION-STATUS.md` correction). Either retire it or rebrand to `m1-json-dtos`.
+Prior swarm `swarm_1779915934241_4kdqcse` is **retired**. `m1-protobuf-codegen` was wrong (DTOs are JSON, not protobuf — see Guardrails below). M1 JSON DTOs are already implemented in `proton-drive-api`; no replacement agent needed. Remaining live work: `m2-rpgp-impl` (crypto bodies), `m3-http-account` (SRP + keyring), `tui-wiring`, `qe-reviewer`.
 
 ## Guardrails worth keeping
 

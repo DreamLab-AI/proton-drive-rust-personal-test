@@ -2,13 +2,20 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
+use crate::app::{LoginField, LoginForm, Screen};
 use crate::panes::{Focus, Pane, Panes};
 
-pub fn render(frame: &mut Frame<'_>, panes: &Panes, focus: Focus) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    panes: &Panes,
+    focus: Focus,
+    screen: &Screen,
+    status: Option<&str>,
+) {
     let area = frame.area();
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -22,8 +29,15 @@ pub fn render(frame: &mut Frame<'_>, panes: &Panes, focus: Focus) {
 
     render_header(frame, layout[0]);
     render_panes(frame, layout[1], panes, focus);
-    render_status(frame, layout[2]);
-    render_keybar(frame, layout[3]);
+    render_status(frame, layout[2], status);
+    render_keybar(frame, layout[3], screen);
+
+    // Login / auth overlay renders on top of everything else.
+    match screen {
+        Screen::Main => {}
+        Screen::Login(form) => render_login_overlay(frame, area, form, false),
+        Screen::Authenticating(_) => render_login_overlay(frame, area, &LoginForm::new(), true),
+    }
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect) {
@@ -84,13 +98,114 @@ fn render_pane(frame: &mut Frame<'_>, area: Rect, pane: &Pane, label: &str, focu
     frame.render_widget(list, area);
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(Paragraph::new(" idle"), area);
+fn render_status(frame: &mut Frame<'_>, area: Rect, status: Option<&str>) {
+    let text = status.unwrap_or(" idle");
+    frame.render_widget(Paragraph::new(text), area);
 }
 
-fn render_keybar(frame: &mut Frame<'_>, area: Rect) {
-    let text = " F2 upload   F3 download   F5 refresh   Tab switch   q quit ";
+fn render_keybar(frame: &mut Frame<'_>, area: Rect, screen: &Screen) {
+    let text = match screen {
+        Screen::Login(_) => " Tab next field   Enter submit   Esc cancel",
+        Screen::Authenticating(_) => " Authenticating…   Esc cancel",
+        Screen::Main => " F4 login   F2 upload   F3 download   F5 refresh   Tab switch   q quit",
+    };
     frame.render_widget(Paragraph::new(text), area);
+}
+
+// ---------------------------------------------------------------------------
+// Login overlay
+// ---------------------------------------------------------------------------
+
+fn render_login_overlay(frame: &mut Frame<'_>, area: Rect, form: &LoginForm, authenticating: bool) {
+    const W: u16 = 54;
+    const H: u16 = 10;
+    let popup = centered_rect(W, H, area);
+
+    frame.render_widget(Clear, popup);
+
+    let title = if authenticating {
+        " Authenticating… "
+    } else {
+        " Login — Proton Drive "
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let cursor = if authenticating { "" } else { "▌" };
+    let email_active = !authenticating && form.field == LoginField::Email;
+    let pass_active = !authenticating && form.field == LoginField::Password;
+
+    let email_val = if email_active {
+        format!("{}{}", form.email, cursor)
+    } else {
+        form.email.clone()
+    };
+    let pass_val = if pass_active {
+        format!("{}{}", "•".repeat(form.password.len()), cursor)
+    } else {
+        "•".repeat(form.password.len())
+    };
+
+    let active_style = Style::default().add_modifier(Modifier::BOLD);
+    let normal_style = Style::default();
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                format!(" {} Email    : ", if email_active { "▶" } else { " " }),
+                if email_active {
+                    active_style
+                } else {
+                    normal_style
+                },
+            ),
+            Span::raw(email_val),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                format!(" {} Password : ", if pass_active { "▶" } else { " " }),
+                if pass_active {
+                    active_style
+                } else {
+                    normal_style
+                },
+            ),
+            Span::raw(pass_val),
+        ]),
+        Line::raw(""),
+    ];
+
+    if authenticating {
+        lines.push(Line::raw("  Authenticating, please wait…"));
+    } else if let Some(err) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Tab: next field   Enter: submit   Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height) / 2);
+    Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
 }
 
 fn human_bytes(n: u64) -> String {

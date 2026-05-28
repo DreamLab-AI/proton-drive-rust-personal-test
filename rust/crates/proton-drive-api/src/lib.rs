@@ -309,6 +309,99 @@ pub mod events {
     }
 }
 
+pub mod auth {
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct AuthInfoRequest {
+        pub username: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct AuthInfoResponse {
+        pub version: u32,
+        pub modulus: String,
+        pub server_ephemeral: String,
+        pub salt: String,
+        #[serde(rename = "SRPSession")]
+        pub srp_session: String,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct AuthRequest {
+        pub username: String,
+        pub client_ephemeral: String,
+        pub client_proof: String,
+        #[serde(rename = "SRPSession")]
+        pub srp_session: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct AuthResponse {
+        #[serde(rename = "UID")]
+        pub uid: String,
+        pub access_token: String,
+        pub refresh_token: String,
+        pub server_proof: String,
+        // Proton returns LocalID (int) on some API versions and omits or nulls UserID.
+        #[serde(rename = "UserID", default, deserialize_with = "null_to_empty")]
+        pub user_id: String,
+        #[serde(rename = "2FA", default)]
+        pub two_factor: TwoFactor,
+    }
+
+    fn null_to_empty<'de, D>(d: D) -> Result<String, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct TwoFactor {
+        pub enabled: u32,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct RefreshRequest {
+        pub response_type: String,
+        pub grant_type: String,
+        pub refresh_token: String,
+        pub redirect_uri: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct RefreshResponse {
+        #[serde(rename = "UID")]
+        pub uid: String,
+        pub access_token: String,
+        pub refresh_token: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct KeySaltsResponse {
+        pub key_salts: Vec<KeySalt>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct KeySalt {
+        #[serde(rename = "ID")]
+        pub id: String,
+        // Proton returns null for keys that have no passphrase (e.g. hardware keys).
+        #[serde(default, deserialize_with = "null_to_empty")]
+        pub key_salt: String,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {

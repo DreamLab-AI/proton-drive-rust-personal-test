@@ -42,8 +42,8 @@ impl Panes {
         Self {
             local,
             remote: Pane {
-                cwd: PathBuf::from("/My Files"),
-                error: Some("remote: auth not configured (M3 deliverable)".into()),
+                cwd: PathBuf::from("/"),
+                error: Some("Not signed in — press Enter or F4 to login".into()),
                 ..Default::default()
             },
         }

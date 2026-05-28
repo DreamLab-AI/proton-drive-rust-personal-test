@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 pub enum Action {
     None,
     Quit,
+    Login,
     TogglePane,
     Up,
     Down,
@@ -23,6 +24,7 @@ pub fn dispatch(code: KeyCode, mods: KeyModifiers) -> Action {
     match code {
         Char('q') => Action::Quit,
         Char('c') if mods.contains(KeyModifiers::CONTROL) => Action::Quit,
+        F(4) | Char('L') => Action::Login,
         Tab | BackTab => Action::TogglePane,
         Up | Char('k') => Action::Up,
         Down | Char('j') => Action::Down,
