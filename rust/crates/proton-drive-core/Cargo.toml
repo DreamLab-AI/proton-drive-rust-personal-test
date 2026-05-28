@@ -1,0 +1,28 @@
+[package]
+name = "proton-drive-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Proton Drive SDK — core domain (nodes, transfer, events)"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+proton-drive-cache.workspace = true
+proton-drive-crypto.workspace = true
+proton-drive-telemetry.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

@@ -1,0 +1,41 @@
+//! Account / Identity supporting subdomain.
+//!
+//! The SDK does not model users or sessions — the host supplies a
+//! [`ProtonDriveAccount`]. Mirrors `js/sdk/src/interface/account.ts`.
+
+use async_trait::async_trait;
+use proton_drive_crypto::PrivateKey;
+
+use crate::error::Result;
+
+/// Active account context the host hands to the SDK.
+#[async_trait]
+pub trait ProtonDriveAccount: Send + Sync {
+    /// Stable user identifier from the Account API.
+    fn user_id(&self) -> &str;
+
+    /// Primary email address tied to the active account.
+    fn primary_email(&self) -> &str;
+
+    /// Resolve an address's private key. Used to decrypt content addressed
+    /// to that address.
+    async fn address_private_key(&self, email: &str) -> Result<PrivateKey>;
+
+    /// Fetch the user's salted key password (for SRP and key decryption).
+    async fn key_password(&self) -> Result<String>;
+}
+
+/// Identity that produced a node or signature.
+/// Mirrors JS `Author` / `AnonymousUser`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Author {
+    User {
+        email: String,
+        display_name: Option<String>,
+    },
+    Anonymous,
+    Unverified {
+        email: String,
+        reason: String,
+    },
+}
