@@ -144,9 +144,12 @@ pub mod shares {
         pub link: super::nodes::Link,
     }
 
+    /// `GET drive/shares/{shareID}` returns the share fields **flat** at the
+    /// envelope level (not wrapped in a `Share` object). `#[serde(flatten)]`
+    /// reproduces the wire shape while keeping the `.share` accessor for callers.
     #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "PascalCase")]
     pub struct GetShareResponse {
+        #[serde(flatten)]
         pub share: Share,
     }
 
@@ -165,8 +168,10 @@ pub mod shares {
         pub passphrase_signature: String,
         #[serde(rename = "AddressID")]
         pub address_id: String,
-        #[serde(rename = "AddressKeyID")]
-        pub address_key_id: String,
+        /// Not present on all share responses (the flat `drive/shares/{id}`
+        /// payload omits it); only meaningful for shares with direct access.
+        #[serde(rename = "AddressKeyID", default)]
+        pub address_key_id: Option<String>,
     }
 }
 
@@ -199,11 +204,16 @@ pub mod nodes {
         pub r#type: u8, // 1 = folder, 2 = file
         pub name: String,
         pub name_signature_email: Option<String>,
-        pub hash: String,
+        /// Name hash. Nullable on the wire (e.g. some folder layouts).
+        #[serde(default)]
+        pub hash: Option<String>,
         #[serde(rename = "MIMEType")]
         pub mime_type: String,
         pub state: u8, // 1 = active, 2 = trashed, 3 = deleted
         pub size: u64,
+        /// Proton's field is `CreateTime` (not `CreatedTime`); `CreationTime`
+        /// is a deprecated alias. Required on link responses.
+        #[serde(rename = "CreateTime")]
         pub created_time: i64,
         pub modify_time: i64,
         pub trashed: Option<i64>,
@@ -220,7 +230,9 @@ pub mod nodes {
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct FileProperties {
-        pub content_key_packet: String,
+        /// Optional on the wire (`ContentKeyPacket?`).
+        #[serde(default)]
+        pub content_key_packet: Option<String>,
         pub content_key_packet_signature: Option<String>,
         pub active_revision: Option<Revision>,
     }
@@ -228,16 +240,23 @@ pub mod nodes {
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct FolderProperties {
-        pub node_hash_key: String,
+        /// Optional on the wire (`NodeHashKey?`); needed to compute the HMAC
+        /// name hash when this folder is an upload parent.
+        #[serde(default)]
+        pub node_hash_key: Option<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct Revision {
-        #[serde(rename = "ID")]
+        #[serde(rename = "ID", default)]
         pub id: String,
+        #[serde(default)]
         pub state: u8,
+        /// Proton's field is `CreateTime`; optional within `ActiveRevision`.
+        #[serde(rename = "CreateTime", default)]
         pub created_time: i64,
+        #[serde(default)]
         pub size: u64,
         pub manifest_signature: Option<String>,
         pub signature_email: Option<String>,
@@ -252,15 +271,21 @@ pub mod upload {
     pub struct CreateFileRequest {
         pub name: String,
         pub hash: String,
+        #[serde(rename = "ParentLinkID")]
         pub parent_link_id: String,
+        #[serde(rename = "MIMEType")]
+        pub mime_type: String,
+        #[serde(rename = "ClientUID")]
+        pub client_uid: Option<String>,
+        /// Coarse size hint for early quota validation; sent as `null` when
+        /// unknown (the server re-validates during commit).
+        pub intended_upload_size: Option<u64>,
         pub node_key: String,
         pub node_passphrase: String,
         pub node_passphrase_signature: String,
-        pub signature_address: String,
         pub content_key_packet: String,
         pub content_key_packet_signature: String,
-        pub mime_type: String,
-        pub client_uid: Option<String>,
+        pub signature_address: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -281,24 +306,35 @@ pub mod upload {
     #[derive(Debug, Clone, Serialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct RequestBlockUploadRequest {
-        pub block_list: Vec<BlockUploadEntry>,
+        #[serde(rename = "AddressID")]
         pub address_id: String,
+        #[serde(rename = "VolumeID")]
+        pub volume_id: String,
         #[serde(rename = "LinkID")]
         pub link_id: String,
         #[serde(rename = "RevisionID")]
         pub revision_id: String,
-        #[serde(rename = "VolumeID")]
-        pub volume_id: String,
+        pub block_list: Vec<BlockUploadEntry>,
+        /// Always sent (empty for non-thumbnail uploads) to match the JS client.
+        pub thumbnail_list: Vec<ThumbnailUploadEntry>,
     }
 
+    /// `Index` + `EncSignature` + `Verifier` only — Proton ignores client-sent
+    /// `Hash`/`Size` for content blocks (the JS client omits them), so they are
+    /// not part of this struct.
     #[derive(Debug, Clone, Serialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct BlockUploadEntry {
         pub index: u32,
-        pub hash: String,
-        pub encrypted_signature: String,
-        pub size: u64,
+        #[serde(rename = "EncSignature")]
+        pub enc_signature: String,
         pub verifier: BlockVerifier,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct ThumbnailUploadEntry {
+        pub r#type: u8,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -327,7 +363,13 @@ pub mod upload {
     pub struct CommitRevisionRequest {
         pub manifest_signature: String,
         pub signature_address: String,
-        pub extended_attributes: Option<String>,
+        /// Encrypted extended attributes — Proton's field is `XAttr`.
+        #[serde(rename = "XAttr")]
+        pub x_attr: String,
+        /// Whether the client verified the content checksum during upload.
+        pub checksum_verified: bool,
+        /// Only used for photos in the Photo volume; always `null` here.
+        pub photo: Option<serde_json::Value>,
     }
 }
 
@@ -380,9 +422,12 @@ pub mod download {
         pub token: String,
         /// Base64-encoded SHA-256 of the ciphertext bytes.
         pub hash: String,
-        /// Encrypted detached signature for this block (optional for legacy revisions).
+        /// Encrypted detached signature for this block — Proton's field is
+        /// `EncSignature` (optional for legacy revisions).
+        #[serde(rename = "EncSignature", default)]
         pub encrypted_signature: Option<String>,
         /// Ciphertext size in bytes.
+        #[serde(default)]
         pub size: u64,
     }
 }
@@ -542,7 +587,7 @@ mod tests {
                 "LinkID": "l1", "ParentLinkID": "root",
                 "Type": 1, "Name": "encrypted-name", "Hash": "hex",
                 "MIMEType": "Folder", "State": 1, "Size": 0,
-                "CreatedTime": 1, "ModifyTime": 2,
+                "CreateTime": 1, "ModifyTime": 2,
                 "NodeKey": "armored", "NodePassphrase": "armored",
                 "NodePassphraseSignature": "armored",
                 "FolderProperties": { "NodeHashKey": "armored" }
@@ -573,7 +618,7 @@ mod tests {
                     "MIMEType": "Folder",
                     "State": 1,
                     "Size": 0,
-                    "CreatedTime": 1700000000,
+                    "CreateTime": 1700000000,
                     "ModifyTime": 1700000100,
                     "NodeKey": "-----BEGIN PGP PUBLIC KEY BLOCK-----\\nabc\\n-----END PGP PUBLIC KEY BLOCK-----",
                     "NodePassphrase": "-----BEGIN PGP MESSAGE-----\\ndef\\n-----END PGP MESSAGE-----",
@@ -589,7 +634,7 @@ mod tests {
                     "MIMEType": "text/plain",
                     "State": 1,
                     "Size": 1234,
-                    "CreatedTime": 1700001000,
+                    "CreateTime": 1700001000,
                     "ModifyTime": 1700001100,
                     "NodeKey": "-----BEGIN PGP PUBLIC KEY BLOCK-----\\nxyz\\n-----END PGP PUBLIC KEY BLOCK-----",
                     "NodePassphrase": "-----BEGIN PGP MESSAGE-----\\nuvw\\n-----END PGP MESSAGE-----",
@@ -600,7 +645,7 @@ mod tests {
                         "ActiveRevision": {
                             "ID": "rev-1",
                             "State": 1,
-                            "CreatedTime": 1700001050,
+                            "CreateTime": 1700001050,
                             "Size": 1234
                         }
                     }
@@ -650,7 +695,7 @@ mod tests {
                     "MIMEType": "Folder",
                     "State": 1,
                     "Size": 0,
-                    "CreatedTime": 1700000000,
+                    "CreateTime": 1700000000,
                     "ModifyTime": 1700000001,
                     "NodeKey": "rootnodekey",
                     "NodePassphrase": "rootpassphrase",
@@ -664,5 +709,142 @@ mod tests {
         assert_eq!(resp.share.address_id, "addr-001");
         assert_eq!(resp.link.link.link_id, "root-link-001");
         assert_eq!(resp.link.link.r#type, 1);
+    }
+
+    /// `GET drive/shares/{shareID}` returns share fields **flat** at the
+    /// top level (no `Share` wrapper). `#[serde(flatten)]` must reproduce
+    /// this while keeping the `.share` accessor, and `AddressKeyID` must
+    /// tolerate absence (the flat payload omits it).
+    #[test]
+    fn deserialize_flat_get_share_response() {
+        let body = r#"{
+            "Code": 1000,
+            "ShareID": "share-flat-1",
+            "VolumeID": "vol-flat-1",
+            "LinkID": "link-flat-1",
+            "Type": 1,
+            "Key": "-----BEGIN PGP PRIVATE KEY BLOCK-----\\nk\\n-----END PGP PRIVATE KEY BLOCK-----",
+            "Passphrase": "-----BEGIN PGP MESSAGE-----\\np\\n-----END PGP MESSAGE-----",
+            "PassphraseSignature": "-----BEGIN PGP SIGNATURE-----\\ns\\n-----END PGP SIGNATURE-----",
+            "AddressID": "addr-flat-1"
+        }"#;
+        let env: common::ResponseEnvelope<shares::GetShareResponse> =
+            serde_json::from_str(body).expect("parse flat share");
+        assert_eq!(env.code, common::CODE_OK);
+        let s = &env.inner.share;
+        assert_eq!(s.share_id, "share-flat-1");
+        assert_eq!(s.volume_id, "vol-flat-1");
+        assert_eq!(s.link_id, "link-flat-1");
+        assert_eq!(s.address_id, "addr-flat-1");
+        assert!(
+            s.address_key_id.is_none(),
+            "flat payload omits AddressKeyID"
+        );
+    }
+
+    /// `ActiveRevision` carries `CreateTime` (not `CreatedTime`); the rename
+    /// must map it onto `created_time`. A fabricated `CreatedTime` fixture
+    /// would silently default to 0 — guard against that regression.
+    #[test]
+    fn revision_uses_create_time_field() {
+        let body = r#"{
+            "ID": "rev-9",
+            "State": 1,
+            "CreateTime": 1700009999,
+            "Size": 42
+        }"#;
+        let rev: nodes::Revision = serde_json::from_str(body).expect("parse revision");
+        assert_eq!(
+            rev.created_time, 1700009999,
+            "CreateTime must map to created_time"
+        );
+        assert_eq!(rev.size, 42);
+    }
+
+    /// Upload create request must emit Proton's exact PascalCase keys, send
+    /// `IntendedUploadSize: null` when unknown, and key the client identifier
+    /// as `ClientUID` (uppercase UID).
+    #[test]
+    fn serialize_create_file_request_shape() {
+        let req = upload::CreateFileRequest {
+            name: "enc-name".into(),
+            hash: "namehash".into(),
+            parent_link_id: "parent-1".into(),
+            mime_type: "text/plain".into(),
+            client_uid: None,
+            intended_upload_size: None,
+            node_key: "nk".into(),
+            node_passphrase: "np".into(),
+            node_passphrase_signature: "nps".into(),
+            content_key_packet: "ckp".into(),
+            content_key_packet_signature: "ckps".into(),
+            signature_address: "sig@addr".into(),
+        };
+        let v = serde_json::to_value(&req).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(
+            obj.contains_key("MIMEType"),
+            "must use MIMEType, not MimeType"
+        );
+        assert!(
+            obj.contains_key("ClientUID"),
+            "must use ClientUID, not ClientUid"
+        );
+        assert!(obj.contains_key("ParentLinkID"));
+        assert!(obj.contains_key("IntendedUploadSize"));
+        assert!(
+            obj["IntendedUploadSize"].is_null(),
+            "unknown size sent as null"
+        );
+        assert!(obj["ClientUID"].is_null());
+        assert_eq!(obj["Hash"], "namehash");
+    }
+
+    /// Content block entries carry only Index/EncSignature/Verifier — Proton
+    /// ignores client-sent Hash/Size, and the JS client omits them, so they
+    /// must NOT appear on the wire.
+    #[test]
+    fn serialize_block_upload_entry_omits_hash_and_size() {
+        let entry = upload::BlockUploadEntry {
+            index: 1,
+            enc_signature: "encsig".into(),
+            verifier: upload::BlockVerifier {
+                token: "tok".into(),
+            },
+        };
+        let v = serde_json::to_value(&entry).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("Index"));
+        assert!(obj.contains_key("EncSignature"));
+        assert!(obj.contains_key("Verifier"));
+        assert!(
+            !obj.contains_key("Hash"),
+            "Hash must not be sent for content blocks"
+        );
+        assert!(
+            !obj.contains_key("Size"),
+            "Size must not be sent for content blocks"
+        );
+        assert_eq!(obj["Verifier"]["Token"], "tok");
+    }
+
+    /// Commit request uses `XAttr` (not `XAttribute`), `ChecksumVerified`,
+    /// and a `Photo` field that serializes to null for non-photo uploads.
+    #[test]
+    fn serialize_commit_revision_request_shape() {
+        let req = upload::CommitRevisionRequest {
+            manifest_signature: "msig".into(),
+            signature_address: "sig@addr".into(),
+            x_attr: "encrypted-xattr".into(),
+            checksum_verified: true,
+            photo: None,
+        };
+        let v = serde_json::to_value(&req).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("XAttr"), "must use XAttr key");
+        assert!(obj.contains_key("ChecksumVerified"));
+        assert!(obj.contains_key("Photo"));
+        assert!(obj["Photo"].is_null(), "non-photo upload sends Photo: null");
+        assert_eq!(obj["ChecksumVerified"], true);
     }
 }

@@ -133,7 +133,6 @@ struct EncryptedBlock {
     enc_signature: String,
     /// XOR-based verifier token (base64)
     verifier_token_b64: String,
-    size: u64,
 }
 
 // ── ProtonFileUploader ────────────────────────────────────────────────────────
@@ -338,14 +337,15 @@ impl ProtonFileUploader {
             name: encrypted_name_armored,
             hash: name_hash_hex,
             parent_link_id: self.parent.node_id.clone(),
+            mime_type: self.metadata.media_type.clone(),
+            client_uid: None,
+            intended_upload_size: None,
             node_key: node_pub_armored,
             node_passphrase: node_passphrase_armored,
             node_passphrase_signature: passphrase_sig_armored,
-            signature_address: address_email.clone(),
             content_key_packet: content_key_packet_b64,
             content_key_packet_signature: content_key_sig_armored,
-            mime_type: self.metadata.media_type.clone(),
-            client_uid: None,
+            signature_address: address_email.clone(),
         };
 
         let (link_id, revision_id) = self.post_create_file(&volume_id, create_req).await?;
@@ -460,7 +460,6 @@ impl ProtonFileUploader {
                 ciphertext_hash_hex,
                 enc_signature: enc_signature_armored,
                 verifier_token_b64,
-                size: read_bytes as u64,
             });
 
             block_index += 1;
@@ -491,9 +490,7 @@ impl ProtonFileUploader {
             .iter()
             .map(|b| BlockUploadEntry {
                 index: b.index,
-                hash: b.ciphertext_hash_hex.clone(),
-                encrypted_signature: b.enc_signature.clone(),
-                size: b.size,
+                enc_signature: b.enc_signature.clone(),
                 verifier: ApiBlockVerifier {
                     token: b.verifier_token_b64.clone(),
                 },
@@ -501,11 +498,12 @@ impl ProtonFileUploader {
             .collect();
 
         let block_req = RequestBlockUploadRequest {
-            block_list: block_entries,
             address_id: address_email.clone(),
+            volume_id: volume_id.clone(),
             link_id: link_id.clone(),
             revision_id: revision_id.clone(),
-            volume_id: volume_id.clone(),
+            block_list: block_entries,
+            thumbnail_list: Vec::new(),
         };
 
         let upload_links = self.post_request_blocks(block_req).await?;
@@ -572,7 +570,9 @@ impl ProtonFileUploader {
         let commit_req = CommitRevisionRequest {
             manifest_signature: manifest_sig_armored,
             signature_address: address_email.clone(),
-            extended_attributes: Some(xattr_armored),
+            x_attr: xattr_armored,
+            checksum_verified: false,
+            photo: None,
         };
 
         self.put_commit_revision(&volume_id, &link_id, &revision_id, commit_req)
@@ -1156,19 +1156,19 @@ mod tests {
         // 6. POST <bare_url>  → upload block (BlobRequest)
         // 7. PUT /drive/v2/volumes/.../revisions/{revID}  → commit revision
 
+        // `GET drive/shares/{shareID}` returns share fields flat at the envelope
+        // level (no `Share` wrapper) — matches `GetShareResponse`'s flatten.
         let share_resp = serde_json::json!({
             "Code": 1000,
-            "Share": {
-                "ShareID": "share-abc",
-                "VolumeID": "vol-xyz",
-                "LinkID": "root-link",
-                "Type": 1,
-                "Key": "FAKE_SHARE_KEY",
-                "Passphrase": base64::engine::general_purpose::STANDARD.encode("FAKE_ENC:my-share-passphrase"),
-                "PassphraseSignature": "SIG:fake",
-                "AddressID": "addr-001",
-                "AddressKeyID": "key-001"
-            }
+            "ShareID": "share-abc",
+            "VolumeID": "vol-xyz",
+            "LinkID": "root-link",
+            "Type": 1,
+            "Key": "FAKE_SHARE_KEY",
+            "Passphrase": base64::engine::general_purpose::STANDARD.encode("FAKE_ENC:my-share-passphrase"),
+            "PassphraseSignature": "SIG:fake",
+            "AddressID": "addr-001",
+            "AddressKeyID": "key-001"
         });
         let share_bytes = serde_json::to_vec(&share_resp).unwrap();
 
