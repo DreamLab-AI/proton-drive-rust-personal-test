@@ -15,6 +15,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use sha1::Digest as Sha1Digest;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::http::{BlobRequest, HttpMethod, JsonRequest, ProtonDriveHttpClient};
@@ -577,12 +578,13 @@ pub async fn decrypt_node_private_key(
         .await
         .map_err(|e| Error::Decryption(format!("node passphrase plaintext: {e}")))?;
 
-    let passphrase = std::str::from_utf8(&passphrase_bytes)
-        .map_err(|e| Error::Internal(format!("passphrase utf-8: {e}")))?
-        .to_owned();
+    // Secret material: wipe the heap buffer on drop (ADR-0011).
+    let passphrase = Zeroizing::new(passphrase_bytes);
+    let passphrase_str = std::str::from_utf8(&passphrase)
+        .map_err(|e| Error::Internal(format!("passphrase utf-8: {e}")))?;
 
     let node_priv = crypto
-        .decrypt_key(node_key_armored, &passphrase)
+        .decrypt_key(node_key_armored, passphrase_str)
         .await
         .map_err(|e| Error::Decryption(format!("node key unlock: {e}")))?;
 
@@ -610,12 +612,13 @@ pub async fn decrypt_share_key(
         .await
         .map_err(|e| Error::Decryption(format!("share passphrase plaintext: {e}")))?;
 
-    let passphrase = std::str::from_utf8(&pp_bytes_plain)
-        .map_err(|e| Error::Internal(format!("share passphrase utf-8: {e}")))?
-        .to_owned();
+    // Secret material: wipe the heap buffer on drop (ADR-0011).
+    let passphrase = Zeroizing::new(pp_bytes_plain);
+    let passphrase_str = std::str::from_utf8(&passphrase)
+        .map_err(|e| Error::Internal(format!("share passphrase utf-8: {e}")))?;
 
     let share_priv = crypto
-        .decrypt_key(share_key_armored, &passphrase)
+        .decrypt_key(share_key_armored, passphrase_str)
         .await
         .map_err(|e| Error::Decryption(format!("share key unlock: {e}")))?;
 
