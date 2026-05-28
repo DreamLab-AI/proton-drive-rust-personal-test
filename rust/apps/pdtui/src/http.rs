@@ -165,8 +165,16 @@ impl ProtonDriveHttpClient for ReqwestHttpClient {
         // (e.g. https://upload.proton.me/block/...). These are opaque blobs;
         // never rewrite them or prepend the API base_url. Only relative paths
         // are joined against base_url.
-        let url = if req.path.starts_with("http://") || req.path.starts_with("https://") {
+        //
+        // We attach `Authorization: Bearer {token}` to this request, so a
+        // plaintext http:// BareURL would leak the bearer token. Reject it.
+        let url = if req.path.starts_with("https://") {
             req.path.clone()
+        } else if req.path.starts_with("http://") {
+            return Err(Error::Validation(format!(
+                "refusing to send bearer token to non-https BareURL: {}",
+                req.path
+            )));
         } else {
             format!(
                 "{}/{}",

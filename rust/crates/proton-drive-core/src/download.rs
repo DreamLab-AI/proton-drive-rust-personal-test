@@ -494,53 +494,6 @@ pub async fn resolve_active_revision(
     Ok((revision_id, signature_email))
 }
 
-/// Decrypt the node's private key using the share's session key.
-///
-/// For MVP, only files directly under the share root are supported.
-/// Files nested in sub-folders need the parent folder key, which requires
-/// walking up the tree — deferred.
-///
-/// # MVP scope: root-level files only
-/// For files in MyFiles root, parent IS the share root whose key comes
-/// from the share's Passphrase (encrypted to the user's address key).
-/// Walking up for nested files requires multi-hop key derivation; that
-/// is deferred with `Error::NotImplemented`.
-pub async fn decrypt_node_key(
-    crypto: &Arc<dyn OpenPgpCrypto>,
-    node_passphrase_b64: &str,
-    share_key: &PrivateKey,
-) -> Result<PrivateKey> {
-    let ckp_bytes = base64::engine::general_purpose::STANDARD
-        .decode(node_passphrase_b64)
-        .map_err(|e| Error::Internal(format!("NodePassphrase base64: {e}")))?;
-
-    let passphrase_session_key = crypto
-        .decrypt_session_key(&ckp_bytes, std::slice::from_ref(share_key))
-        .await
-        .map_err(|e| Error::Decryption(format!("node passphrase session key: {e}")))?;
-
-    // The node passphrase (cleartext) is the plaintext wrapped in the session key.
-    let (passphrase_bytes, _) = crypto
-        .decrypt_and_verify(&ckp_bytes, &passphrase_session_key, &[])
-        .await
-        .map_err(|e| Error::Decryption(format!("node passphrase decrypt: {e}")))?;
-
-    let passphrase = std::str::from_utf8(&passphrase_bytes)
-        .map_err(|e| Error::Internal(format!("node passphrase utf-8: {e}")))?
-        .to_owned();
-
-    // Not used yet — caller will decrypt node key with this passphrase.
-    // Return it as-is; it's the unwrapped passphrase string.
-    drop(passphrase);
-
-    // Caller must also pass node_key_armored; this function only decrypts
-    // the passphrase. The split is intentional: ProtonDriveClient has the
-    // node_key_armored from the Link DTO, not this function.
-    Err(Error::NotImplemented(
-        "decrypt_node_key is a stub — use decrypt_node_private_key instead",
-    ))
-}
-
 /// Full node key decryption: decrypt passphrase from NodePassphrase, then
 /// unlock the NodeKey armored private key with that passphrase.
 ///

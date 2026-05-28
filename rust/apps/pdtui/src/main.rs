@@ -126,6 +126,10 @@ async fn run_probe() -> ExitCode {
 }
 
 async fn run_tui() -> ExitCode {
+    // Restore the terminal on panic before the default hook prints the message,
+    // otherwise raw mode + alternate screen leave the user's shell unusable.
+    install_panic_hook();
+
     let mut term = match enter_terminal() {
         Ok(t) => t,
         Err(e) => {
@@ -173,4 +177,16 @@ fn leave_terminal(term: &mut Term) -> io::Result<()> {
     )?;
     term.show_cursor()?;
     Ok(())
+}
+
+/// Install a panic hook that best-effort restores the terminal (leaves raw
+/// mode and the alternate screen) before delegating to the previous hook, so a
+/// panic inside the TUI does not leave the user's shell garbled.
+fn install_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        original(info);
+    }));
 }
