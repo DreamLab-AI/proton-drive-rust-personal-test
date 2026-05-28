@@ -1112,6 +1112,13 @@ mod tests {
         ) -> std::result::Result<VerificationStatus, CryptoError> {
             Ok(VerificationStatus::Ok)
         }
+
+        async fn public_key(&self, key: &CPrivKey) -> std::result::Result<CPubKey, CryptoError> {
+            Ok(CPubKey {
+                armored: "FAKE_PUB_KEY".into(),
+                fingerprint_hex: key.fingerprint_hex.clone(),
+            })
+        }
     }
 
     // ── Fake account ──────────────────────────────────────────────────────────

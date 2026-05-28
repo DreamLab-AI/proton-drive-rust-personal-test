@@ -235,6 +235,11 @@ pub trait OpenPgpCrypto: Send + Sync {
         signature: &[u8],
         verification_keys: &[PublicKey],
     ) -> Result<VerificationStatus, CryptoError>;
+
+    /// Derive the public key from a private key. Used for the node-key
+    /// signature-verification fallback when no signer address is available
+    /// (JS `getRevisionVerificationKeys` returns `[nodeKey]`).
+    async fn public_key(&self, key: &PrivateKey) -> Result<PublicKey, CryptoError>;
 }
 
 // ── RpgpCrypto ───────────────────────────────────────────────────────────────
@@ -776,6 +781,18 @@ impl OpenPgpCrypto for RpgpCrypto {
             }
         }
         Ok(VerificationStatus::SignatureWrongSigner)
+    }
+
+    async fn public_key(&self, key: &PrivateKey) -> Result<PublicKey, CryptoError> {
+        let sec = Self::parse_secret_key(key)?;
+        let armored = sec
+            .signed_public_key()
+            .to_armored_string(None.into())
+            .map_err(|e| CryptoError::Key(e.to_string()))?;
+        Ok(PublicKey {
+            armored,
+            fingerprint_hex: key.fingerprint_hex.clone(),
+        })
     }
 }
 

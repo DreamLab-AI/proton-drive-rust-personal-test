@@ -216,14 +216,13 @@ impl FileDownloader {
         sorted_blocks: &[BlockResponse],
         manifest_sig_armored: Option<&str>,
     ) -> Result<()> {
+        // Missing manifest signature is an integrity failure, not a legacy
+        // tolerance. JS cryptoService.verifyManifest throws IntegrityError
+        // ("Missing integrity signature") when armoredManifestSignature is absent.
         let Some(manifest_sig) = manifest_sig_armored else {
-            // Legacy revisions may have no manifest signature — warn and continue
-            // (mirrors JS `ignoreManifestVerification` path for legacy content).
-            tracing::warn!(
-                node_id = %self.node_uid.node_id,
-                "revision has no ManifestSignature — legacy revision, skipping manifest check"
-            );
-            return Ok(());
+            return Err(Error::Verification(
+                "revision has no ManifestSignature — integrity check failed".into(),
+            ));
         };
 
         // manifest_payload = raw SHA-256 bytes of each block hash, concatenated
@@ -241,37 +240,28 @@ impl FileDownloader {
             .decode(manifest_sig)
             .map_err(|e| Error::Internal(format!("ManifestSignature base64: {e}")))?;
 
+        // Verification keys: the signer address's public key when known,
+        // otherwise fall back to the node's own public key. JS
+        // getRevisionVerificationKeys returns `[nodeKey]` when no signer email
+        // is present — it never skips verification.
         let verification_keys: Vec<proton_drive_crypto::PublicKey> =
-            self.signature_address_pub.iter().cloned().collect();
-
-        if verification_keys.is_empty() {
-            tracing::warn!(
-                node_id = %self.node_uid.node_id,
-                "no signature address public key — skipping manifest verification"
-            );
-            return Ok(());
-        }
+            match self.signature_address_pub.as_ref() {
+                Some(addr_pub) => vec![addr_pub.clone()],
+                None => vec![self.crypto.public_key(&self.node_private_key).await?],
+            };
 
         let status = self
             .crypto
             .verify(&manifest_payload, &sig_bytes, &verification_keys)
             .await?;
 
+        // Only a valid signature passes. NoSignature / invalid / wrong-signer
+        // all fail: JS requires verified == SIGNED_AND_VALID.
         match status {
             VerificationStatus::Ok => Ok(()),
-            VerificationStatus::NoSignature => {
-                // Legacy: no embedded signature packet — tolerated per ADR-0009.
-                tracing::warn!(
-                    node_id = %self.node_uid.node_id,
-                    "manifest signature: NoSignature — legacy revision"
-                );
-                Ok(())
-            }
-            VerificationStatus::SignatureInvalid | VerificationStatus::SignatureWrongSigner => {
-                Err(Error::Verification(
-                    "ManifestSignature failed — aborting before any block is decrypted".into(),
-                ))
-            }
+            other => Err(Error::Verification(format!(
+                "ManifestSignature {other:?} — aborting before any block is decrypted"
+            ))),
         }
     }
 
@@ -865,6 +855,18 @@ mod tests {
             .unwrap();
         let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
 
+        // Valid manifest signature over the *correct* hash, so manifest
+        // verification passes and we reach the per-block hash check, which
+        // fails on the tampered bytes.
+        let correct_hash_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&correct_hash)
+            .unwrap();
+        let manifest_sig = crypto
+            .sign(&correct_hash_bytes, &sign_key, "")
+            .await
+            .unwrap();
+        let manifest_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+
         let revision_json = serde_json::json!({
             "Code": 1000,
             "Revision": {
@@ -872,7 +874,7 @@ mod tests {
                 "Blocks": [{"Index": 1, "BareURL": "https://cdn/block", "Token": "t",
                              "Hash": correct_hash, "EncryptedSignature": null,
                              "Size": tampered.len() as u64}],
-                "ManifestSignature": null, "ContentKeyPacket": ckp_b64,
+                "ManifestSignature": manifest_sig_b64, "ContentKeyPacket": ckp_b64,
                 "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
             }
         })
@@ -933,6 +935,150 @@ mod tests {
             matches!(err, Error::NotFound(_) | Error::Internal(_)),
             "expected NotFound or Internal, got {err:?}"
         );
+    }
+
+    /// Security: a revision with no ManifestSignature must abort the download
+    /// (JS throws IntegrityError "Missing integrity signature"). The block must
+    /// never be decrypted.
+    #[tokio::test]
+    async fn missing_manifest_signature_aborts() {
+        let (crypto, sign_key, sign_pub) = make_crypto_material("p").await;
+        let crypto = Arc::new(crypto);
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let ciphertext = crypto
+            .encrypt_and_sign(
+                b"secret",
+                &session_key,
+                std::slice::from_ref(&sign_pub),
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let hash = block_hash_b64(&ciphertext);
+        let ckp_bytes = crypto
+            .encrypt_session_key(&session_key, std::slice::from_ref(&sign_pub))
+            .await
+            .unwrap();
+        let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
+
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1", "State": 1,
+                "Blocks": [{"Index": 1, "BareURL": "https://cdn/block", "Token": "t",
+                             "Hash": hash, "EncryptedSignature": null,
+                             "Size": ciphertext.len() as u64}],
+                "ManifestSignature": null, "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add("revisions/rev-1", Bytes::from(revision_json));
+        mock.add("cdn/block", Bytes::from(ciphertext));
+
+        let downloader = FileDownloader {
+            http: Arc::new(mock),
+            crypto,
+            node_uid: NodeUid {
+                volume_id: "v".into(),
+                node_id: "l".into(),
+            },
+            volume_id: "v".into(),
+            share_id: "s".into(),
+            revision_id: "rev-1".into(),
+            node_private_key: sign_key,
+            signature_address_pub: Some(sign_pub),
+        };
+
+        let mut out = Vec::new();
+        let err = downloader.download_to_writer(&mut out).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Verification(_)),
+            "expected Verification, got {err:?}"
+        );
+        assert!(out.is_empty(), "no plaintext must be written on abort");
+    }
+
+    /// Security: when no signer address public key is available, manifest
+    /// verification falls back to the node's own public key (JS
+    /// getRevisionVerificationKeys → `[nodeKey]`) rather than skipping.
+    #[tokio::test]
+    async fn manifest_verifies_with_node_key_fallback() {
+        let (crypto, node_key, node_pub) = make_crypto_material("node-pass").await;
+        let crypto = Arc::new(crypto);
+
+        let plaintext = b"fallback verification path";
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let ciphertext = crypto
+            .encrypt_and_sign(
+                plaintext,
+                &session_key,
+                std::slice::from_ref(&node_pub),
+                &node_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let hash = block_hash_b64(&ciphertext);
+        let ckp_bytes = crypto
+            .encrypt_session_key(&session_key, std::slice::from_ref(&node_pub))
+            .await
+            .unwrap();
+        let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
+
+        // Manifest signed by the node key — the only key the downloader can
+        // fall back to, since signature_address_pub is None.
+        let hash_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&hash)
+            .unwrap();
+        let manifest_sig = crypto.sign(&hash_bytes, &node_key, "").await.unwrap();
+        let manifest_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1", "State": 1,
+                "Blocks": [{"Index": 1, "BareURL": "https://cdn/block", "Token": "t",
+                             "Hash": hash, "EncryptedSignature": null,
+                             "Size": ciphertext.len() as u64}],
+                "ManifestSignature": manifest_sig_b64, "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add("revisions/rev-1", Bytes::from(revision_json));
+        mock.add("cdn/block", Bytes::from(ciphertext));
+
+        let downloader = FileDownloader {
+            http: Arc::new(mock),
+            crypto,
+            node_uid: NodeUid {
+                volume_id: "v".into(),
+                node_id: "l".into(),
+            },
+            volume_id: "v".into(),
+            share_id: "s".into(),
+            revision_id: "rev-1".into(),
+            node_private_key: node_key,
+            signature_address_pub: None,
+        };
+
+        let mut out = Vec::new();
+        let stats = downloader.download_to_writer(&mut out).await.unwrap();
+        assert_eq!(out, plaintext);
+        assert_eq!(stats.blocks, 1);
     }
 
     /// Round-trip test (gated `#[ignore]` — requires live credentials).
