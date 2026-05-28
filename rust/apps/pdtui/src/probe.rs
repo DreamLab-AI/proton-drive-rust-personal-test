@@ -11,7 +11,7 @@ use proton_drive::{
     ProtonDriveHttpClient,
     http::{HttpMethod, JsonRequest},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::session::Session;
 
@@ -29,16 +29,23 @@ pub struct ProbeResult {
 const BODY_PREVIEW_BYTES: usize = 1024;
 
 pub async fn run_all(http: Arc<dyn ProtonDriveHttpClient>, session: &Session) -> Vec<ProbeResult> {
-    let probes: &[(&'static str, &'static str)] = &[
-        ("get_users", "core/v4/users"),
-        ("list_shares", "drive/shares"),
-        ("get_latest_event_id", "drive/v2/events/latest"),
-    ];
+    let mut results = Vec::with_capacity(3);
 
-    let mut results = Vec::with_capacity(probes.len());
-    for (name, path) in probes {
-        results.push(run_one(http.clone(), session, name, path).await);
-    }
+    results.push(run_one(http.clone(), session, "get_users", "core/v4/users").await);
+
+    let shares = run_one(http.clone(), session, "list_shares", "drive/shares").await;
+    let volume_id = shares
+        .body_preview
+        .as_deref()
+        .and_then(extract_first_volume_id);
+    results.push(shares);
+
+    let event_path = match volume_id {
+        Some(vid) => format!("drive/volumes/{vid}/events/latest"),
+        None => "drive/volumes/UNKNOWN/events/latest".to_owned(),
+    };
+    results.push(run_one(http, session, "get_latest_event_id", &event_path).await);
+
     results
 }
 
@@ -75,5 +82,58 @@ async fn run_one(
             body_preview: None,
             error: Some(e.to_string()),
         },
+    }
+}
+
+/// Extract the first share's VolumeID from a `drive/shares` response body.
+/// Tolerant of either `{"Shares":[...]}` or a bare `[...]` array. Returns
+/// `None` if the body isn't valid JSON or has no shares.
+fn extract_first_volume_id(body: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ShareLike {
+        #[serde(rename = "VolumeID")]
+        volume_id: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(rename = "Shares")]
+        shares: Option<Vec<ShareLike>>,
+    }
+
+    if let Ok(env) = serde_json::from_str::<Envelope>(body)
+        && let Some(shares) = env.shares
+        && let Some(first) = shares.into_iter().next()
+    {
+        return first.volume_id;
+    }
+    if let Ok(arr) = serde_json::from_str::<Vec<ShareLike>>(body)
+        && let Some(first) = arr.into_iter().next()
+    {
+        return first.volume_id;
+    }
+    None
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_volume_id_from_envelope() {
+        let body = r#"{"Code":1000,"Shares":[{"ShareID":"s1","VolumeID":"v1","LinkID":"l1"}]}"#;
+        assert_eq!(extract_first_volume_id(body).as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn extracts_volume_id_from_bare_array() {
+        let body = r#"[{"ShareID":"s1","VolumeID":"v2"}]"#;
+        assert_eq!(extract_first_volume_id(body).as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn returns_none_on_garbage() {
+        assert!(extract_first_volume_id("not json").is_none());
+        assert!(extract_first_volume_id(r#"{"Shares":[]}"#).is_none());
     }
 }

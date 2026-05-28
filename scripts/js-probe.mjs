@@ -29,15 +29,9 @@ const appVersion =
     session.AppVersion ??
     "external-drive-pdtui@0.0.1-stable";
 
-const PROBES = [
-    ["get_users", "core/v4/users"],
-    ["list_shares", "drive/shares"],
-    ["get_latest_event_id", "drive/v2/events/latest"],
-];
-
 const PREVIEW = 1024;
 
-for (const [name, path] of PROBES) {
+async function probe(name, path) {
     const url = `${baseUrl.replace(/\/$/, "")}/${path}`;
     try {
         const resp = await fetch(url, {
@@ -51,12 +45,9 @@ for (const [name, path] of PROBES) {
         });
         const text = await resp.text();
         const preview = text.slice(0, PREVIEW);
-        console.log(JSON.stringify({
-            name,
-            status: resp.status,
-            ok: resp.ok,
-            body_preview: preview,
-        }));
+        const result = { name, status: resp.status, ok: resp.ok, body_preview: preview };
+        console.log(JSON.stringify(result));
+        return { ok: resp.ok, text };
     } catch (e) {
         console.log(JSON.stringify({
             name,
@@ -64,5 +55,24 @@ for (const [name, path] of PROBES) {
             ok: false,
             error: String(e?.message ?? e),
         }));
+        return { ok: false, text: "" };
     }
 }
+
+function extractFirstVolumeId(body) {
+    try {
+        const parsed = JSON.parse(body);
+        const arr = Array.isArray(parsed) ? parsed : parsed?.Shares;
+        return arr?.[0]?.VolumeID ?? null;
+    } catch {
+        return null;
+    }
+}
+
+await probe("get_users", "core/v4/users");
+const shares = await probe("list_shares", "drive/shares");
+const volumeId = shares.ok ? extractFirstVolumeId(shares.text) : null;
+const eventPath = volumeId
+    ? `drive/volumes/${volumeId}/events/latest`
+    : "drive/volumes/UNKNOWN/events/latest";
+await probe("get_latest_event_id", eventPath);
