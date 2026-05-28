@@ -7,6 +7,8 @@
 //!   PDTUI_TEST_PASSWORD=yourpassword \
 //!   cargo test -p pdtui --test auth_integration -- --ignored --nocapture
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use pdtui::auth;
 use pdtui::http::ReqwestHttpClient;
 
@@ -16,10 +18,9 @@ const APP_VERSION: &str = "external-drive-pdtui@0.0.1-stable";
 #[tokio::test]
 #[ignore = "requires PDTUI_TEST_EMAIL + PDTUI_TEST_PASSWORD"]
 async fn live_srp_login_succeeds() {
-    let email = std::env::var("PDTUI_TEST_EMAIL")
-        .expect("set PDTUI_TEST_EMAIL to run this test");
-    let password = std::env::var("PDTUI_TEST_PASSWORD")
-        .expect("set PDTUI_TEST_PASSWORD to run this test");
+    let email = std::env::var("PDTUI_TEST_EMAIL").expect("set PDTUI_TEST_EMAIL to run this test");
+    let password =
+        std::env::var("PDTUI_TEST_PASSWORD").expect("set PDTUI_TEST_PASSWORD to run this test");
 
     let http = ReqwestHttpClient::new(BASE_URL, APP_VERSION).expect("http client init");
     let creds = auth::login(&http, &email, &password)
@@ -38,6 +39,10 @@ async fn live_srp_login_succeeds() {
     // Masked output — safe to print in --nocapture mode.
     let tok = &creds.access_token;
     println!("✓ uid           : {}", creds.uid);
-    println!("✓ access_token  : {}…{}", &tok[..6.min(tok.len())], &tok[tok.len().saturating_sub(4)..]);
+    println!(
+        "✓ access_token  : {}…{}",
+        &tok[..6.min(tok.len())],
+        &tok[tok.len().saturating_sub(4)..]
+    );
     println!("✓ key_password  : {}…", &creds.key_password[..7]);
 }

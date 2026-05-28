@@ -9,10 +9,16 @@ use thiserror::Error;
 
 use pgp::{
     composed::{
-        Deserializable, MessageBuilder, PlainSessionKey, SignedPublicKey, SignedSecretKey,
-        StandaloneSignature,
+        Deserializable,
+        KeyType,
+        MessageBuilder,
+        PlainSessionKey,
         // Key builder types are re-exported from pgp::composed via key::*
-        SecretKeyParamsBuilder, SubkeyParamsBuilder, KeyType,
+        SecretKeyParamsBuilder,
+        SignedPublicKey,
+        SignedSecretKey,
+        StandaloneSignature,
+        SubkeyParamsBuilder,
     },
     crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm},
     packet::{
@@ -20,7 +26,7 @@ use pgp::{
         SymEncryptedProtectedData,
     },
     ser::Serialize,
-    types::{EskType, KeyDetails, Password, PublicKeyTrait, SecretKeyTrait},
+    types::{EskType, KeyDetails, Password, PublicKeyTrait},
 };
 
 // ── error ─────────────────────────────────────────────────────────────────────
@@ -135,11 +141,8 @@ pub trait SrpModule: Send + Sync {
 
     async fn get_srp_verifier(&self, password: &str) -> Result<SrpVerifier, CryptoError>;
 
-    async fn compute_key_password(
-        &self,
-        password: &str,
-        salt: &str,
-    ) -> Result<String, CryptoError>;
+    async fn compute_key_password(&self, password: &str, salt: &str)
+    -> Result<String, CryptoError>;
 
     fn generate_key_salt(&self) -> String;
 }
@@ -151,11 +154,8 @@ pub trait OpenPgpCrypto: Send + Sync {
     fn generate_passphrase(&self) -> String;
 
     /// Parse `armored` as a PGP private key and verify `passphrase` unlocks it.
-    async fn decrypt_key(
-        &self,
-        armored: &str,
-        passphrase: &str,
-    ) -> Result<PrivateKey, CryptoError>;
+    async fn decrypt_key(&self, armored: &str, passphrase: &str)
+    -> Result<PrivateKey, CryptoError>;
 
     /// Encrypt `data` with `session_key` (SEIPDv1) and sign with `signing_key`.
     /// Prepends PKESK packets when `encryption_keys` is non-empty (node names /
@@ -260,9 +260,8 @@ impl RpgpCrypto {
         base64::engine::general_purpose::STANDARD.encode(buf)
     }
 
-    fn parse_sym_alg(id: u8) -> Result<SymmetricKeyAlgorithm, CryptoError> {
-        SymmetricKeyAlgorithm::try_from(id)
-            .map_err(|_| CryptoError::Key(format!("unknown cipher algorithm id: {id}")))
+    fn parse_sym_alg(id: u8) -> SymmetricKeyAlgorithm {
+        SymmetricKeyAlgorithm::from(id)
     }
 
     /// Map a `SymmetricKeyAlgorithm` back to its OpenPGP numeric id.
@@ -300,18 +299,16 @@ impl RpgpCrypto {
     }
 
     fn parse_secret_key(priv_key: &PrivateKey) -> Result<SignedSecretKey, CryptoError> {
-        let (key, _) = SignedSecretKey::from_armor_single(std::io::Cursor::new(
-            priv_key.armored.as_bytes(),
-        ))
-        .map_err(|e| CryptoError::Key(e.to_string()))?;
+        let (key, _) =
+            SignedSecretKey::from_armor_single(std::io::Cursor::new(priv_key.armored.as_bytes()))
+                .map_err(|e| CryptoError::Key(e.to_string()))?;
         Ok(key)
     }
 
     fn parse_public_key(pub_key: &PublicKey) -> Result<SignedPublicKey, CryptoError> {
-        let (key, _) = SignedPublicKey::from_armor_single(std::io::Cursor::new(
-            pub_key.armored.as_bytes(),
-        ))
-        .map_err(|e| CryptoError::Key(e.to_string()))?;
+        let (key, _) =
+            SignedPublicKey::from_armor_single(std::io::Cursor::new(pub_key.armored.as_bytes()))
+                .map_err(|e| CryptoError::Key(e.to_string()))?;
         Ok(key)
     }
 
@@ -420,9 +417,8 @@ impl OpenPgpCrypto for RpgpCrypto {
         armored: &str,
         passphrase: &str,
     ) -> Result<PrivateKey, CryptoError> {
-        let (key, _) =
-            SignedSecretKey::from_armor_single(std::io::Cursor::new(armored.as_bytes()))
-                .map_err(|e| CryptoError::Key(e.to_string()))?;
+        let (key, _) = SignedSecretKey::from_armor_single(std::io::Cursor::new(armored.as_bytes()))
+            .map_err(|e| CryptoError::Key(e.to_string()))?;
 
         // Verify passphrase by attempting to unlock the key.
         let pw = Password::from(passphrase);
@@ -445,8 +441,7 @@ impl OpenPgpCrypto for RpgpCrypto {
     ) -> Result<SessionKey, CryptoError> {
         let parser = PacketParser::new(std::io::BufReader::new(data));
         for packet_result in parser {
-            let packet =
-                packet_result.map_err(|e| CryptoError::Decrypt(e.to_string()))?;
+            let packet = packet_result.map_err(|e| CryptoError::Decrypt(e.to_string()))?;
 
             let pgp::packet::Packet::PublicKeyEncryptedSessionKey(pkesk) = packet else {
                 continue;
@@ -482,7 +477,7 @@ impl OpenPgpCrypto for RpgpCrypto {
         session_key: &SessionKey,
         verification_keys: &[PublicKey],
     ) -> Result<(Vec<u8>, VerificationStatus), CryptoError> {
-        let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm)?;
+        let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm);
         let plain_sk = PlainSessionKey::V3_4 {
             sym_alg,
             key: session_key.data.clone(),
@@ -533,7 +528,7 @@ impl OpenPgpCrypto for RpgpCrypto {
     ) -> Result<Vec<u8>, CryptoError> {
         Self::reject_aead(&opts)?;
 
-        let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm)?;
+        let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm);
         let sec_key = Self::parse_secret_key(signing_key)?;
         let pw = Password::from(signing_key.passphrase.as_str());
 
@@ -574,7 +569,7 @@ impl OpenPgpCrypto for RpgpCrypto {
         session_key: &SessionKey,
         encryption_keys: &[PublicKey],
     ) -> Result<Vec<u8>, CryptoError> {
-        let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm)?;
+        let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm);
         let mut out = Vec::new();
         for pub_key in encryption_keys {
             let key = Self::parse_public_key(pub_key)?;
@@ -676,12 +671,9 @@ impl OpenPgpCrypto for RpgpCrypto {
         let pw = Password::from(signing_key.passphrase.as_str());
 
         let mut rng = rand::thread_rng();
-        let sig_config = SignatureConfig::from_key(
-            &mut rng,
-            &key.primary_key,
-            SignatureType::Binary,
-        )
-        .map_err(|e| CryptoError::Key(e.to_string()))?;
+        let sig_config =
+            SignatureConfig::from_key(&mut rng, &key.primary_key, SignatureType::Binary)
+                .map_err(|e| CryptoError::Key(e.to_string()))?;
 
         let sig = sig_config
             .sign(&key.primary_key, &pw, std::io::Cursor::new(data))
@@ -705,9 +697,8 @@ impl OpenPgpCrypto for RpgpCrypto {
             return Ok(VerificationStatus::NoSignature);
         }
 
-        let standalone =
-            StandaloneSignature::from_bytes(std::io::BufReader::new(signature))
-                .map_err(|e| CryptoError::Verify(e.to_string()))?;
+        let standalone = StandaloneSignature::from_bytes(std::io::BufReader::new(signature))
+            .map_err(|e| CryptoError::Verify(e.to_string()))?;
 
         for pub_key in verification_keys {
             let key = Self::parse_public_key(pub_key)?;
@@ -727,7 +718,11 @@ impl OpenPgpCrypto for RpgpCrypto {
 // ── unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::unnecessary_fallible_conversions
+)]
 mod tests {
     use super::*;
 
