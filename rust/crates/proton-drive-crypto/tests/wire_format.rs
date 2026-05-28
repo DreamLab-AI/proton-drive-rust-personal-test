@@ -181,14 +181,10 @@ async fn wire_tampered_ciphertext_is_rejected() {
 /// decrypt correctly (the encryption key is unchanged), but the verification
 /// status must not be `Ok`.
 ///
-/// NOTE: The current `decrypt_and_verify` implementation returns
-/// `VerificationStatus::Ok` whenever `verify_nested` returns a non-empty
-/// `Ok` — even if every element of the result vector is `Invalid`.  This is
-/// a known defect tracked by ADR-0012.  Until `lib.rs` is fixed to inspect
-/// the individual `VerificationResult` variants, this test is `#[ignore]`-d
-/// so it does not block CI.  When the lib is fixed, remove `#[ignore]`.
+/// `decrypt_and_verify` inspects the individual `VerificationResult` variants:
+/// a present-but-unvalidated signature maps to `SignatureWrongSigner`, not
+/// `Ok`.  This is the security fix for the defect formerly tracked by ADR-0012.
 #[tokio::test]
-#[ignore = "lib.rs verify_nested maps Invalid results to Ok; fix-forward per ADR-0012"]
 async fn wire_wrong_signer_is_rejected() {
     let crypto = RpgpCrypto::new();
     let fx = load_fixtures(&crypto).await;

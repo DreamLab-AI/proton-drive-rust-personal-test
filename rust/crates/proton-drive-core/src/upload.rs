@@ -752,25 +752,10 @@ impl ProtonFileUploader {
     /// shape here: `Content-Type: multipart/form-data; boundary=...` with a
     /// single "Block" part containing the raw ciphertext bytes.
     ///
-    /// Note: BareURL is absolute (includes scheme+host), so we must NOT prepend
-    /// the Proton base URL. We use `request_blob` which sends the body as-is to
-    /// the given path. However, `request_blob` prepends the base URL.
-    ///
-    /// For block uploads the bare_url is fully qualified. We pass it as the
-    /// full path and rely on the HTTP client implementation to handle it.
-    /// The `ReqwestHttpClient::request_blob` concatenates base_url + path, so
-    /// we would get double URL. Instead, construct the multipart body and issue
-    /// a raw `reqwest` call — but we can only use the trait interface here.
-    ///
-    /// Compromise: encode the body as multipart in the `body` field and set
-    /// `path` to the relative portion, trusting that the bare_url suffix matches
-    /// what `request_blob` would build. This won't work for CDN URLs.
-    ///
-    /// FIXME: This implementation will fail for CDN BareURLs that don't share
-    /// the Proton base URL. A proper fix requires adding an `upload_block(url,
-    /// token, data)` method to `ProtonDriveHttpClient` that accepts a fully
-    /// qualified URL. For now we attempt to use request_blob; live tests will
-    /// reveal whether CDN URLs require a different path.
+    /// BareURL is absolute (includes scheme+host), often on a different host
+    /// than the API base (e.g. `https://upload.proton.me/...`). We pass it as
+    /// the `path`; `request_blob` detects the `http(s)://` prefix and uses the
+    /// URL verbatim rather than joining it against the API base_url.
     async fn put_block(&self, bare_url: &str, token: &str, ciphertext: &[u8]) -> Result<()> {
         // Build multipart/form-data body manually.
         let boundary = "pdtui_block_boundary_x7z9q";

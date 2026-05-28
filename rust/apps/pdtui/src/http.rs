@@ -161,11 +161,19 @@ impl ProtonDriveHttpClient for ReqwestHttpClient {
     }
 
     async fn request_blob(&self, req: BlobRequest) -> Result<JsonResponse> {
-        let url = format!(
-            "{}/{}",
-            self.base_url.trim_end_matches('/'),
-            req.path.trim_start_matches('/')
-        );
+        // Block tokens carry an absolute, server-issued BareURL
+        // (e.g. https://upload.proton.me/block/...). These are opaque blobs;
+        // never rewrite them or prepend the API base_url. Only relative paths
+        // are joined against base_url.
+        let url = if req.path.starts_with("http://") || req.path.starts_with("https://") {
+            req.path.clone()
+        } else {
+            format!(
+                "{}/{}",
+                self.base_url.trim_end_matches('/'),
+                req.path.trim_start_matches('/')
+            )
+        };
         let body: Bytes = req.body.clone();
         let headers = req.headers.clone();
         self.send_with_retry(|| {

@@ -493,6 +493,14 @@ impl OpenPgpCrypto for RpgpCrypto {
             .decrypt_with_session_key(plain_sk)
             .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
 
+        // Determine whether the message actually carries a signature before
+        // draining it into plaintext. A bare SEIPD payload (no signature) must
+        // map to NoSignature, not to a spurious verification verdict.
+        let has_signature = matches!(
+            decrypted,
+            pgp::composed::Message::Signed { .. } | pgp::composed::Message::SignedOnePass { .. }
+        );
+
         let plaintext = decrypted
             .as_data_vec()
             .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
@@ -513,7 +521,16 @@ impl OpenPgpCrypto for RpgpCrypto {
             .collect();
 
         let status = match decrypted.verify_nested(&key_refs) {
-            Ok(results) if !results.is_empty() => VerificationStatus::Ok,
+            Ok(results)
+                if results
+                    .iter()
+                    .any(|r| matches!(r, pgp::composed::VerificationResult::Valid(_))) =>
+            {
+                VerificationStatus::Ok
+            }
+            // A signature is present but none of the supplied keys validated it.
+            Ok(_) if has_signature => VerificationStatus::SignatureWrongSigner,
+            // No signature packet at all (bare SEIPD payload).
             Ok(_) => VerificationStatus::NoSignature,
             Err(_) => VerificationStatus::SignatureInvalid,
         };
