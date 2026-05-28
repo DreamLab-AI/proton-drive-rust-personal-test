@@ -325,6 +325,30 @@ impl RpgpCrypto {
         Ok(key)
     }
 
+    /// Normalise a PGP message to binary packets.
+    ///
+    /// Proton's API delivers `PGPMessage` fields as ASCII-armored text (per the
+    /// OpenAPI spec), but the binary packet parsers (`PacketParser`,
+    /// `Message::from_bytes`) reject armor. Dearmor when the input carries an
+    /// armor header; pass binary input (e.g. a base64-decoded ContentKeyPacket)
+    /// through untouched.
+    fn to_binary_pgp(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, CryptoError> {
+        const ARMOR_PREFIX: &[u8] = b"-----BEGIN PGP";
+        let start = data
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(0);
+        let trimmed = &data[start..];
+        if !trimmed.starts_with(ARMOR_PREFIX) {
+            return Ok(std::borrow::Cow::Borrowed(data));
+        }
+        let mut dearmor = pgp::armor::Dearmor::new(std::io::BufReader::new(trimmed));
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut dearmor, &mut out)
+            .map_err(|e| CryptoError::Decrypt(format!("dearmor: {e}")))?;
+        Ok(std::borrow::Cow::Owned(out))
+    }
+
     /// Write a PKESK packet that wraps `session_key` for `pub_key`'s
     /// first encryption subkey (or primary key if no subkeys exist).
     fn write_pkesk(
@@ -452,7 +476,8 @@ impl OpenPgpCrypto for RpgpCrypto {
         data: &[u8],
         decryption_keys: &[PrivateKey],
     ) -> Result<SessionKey, CryptoError> {
-        let parser = PacketParser::new(std::io::BufReader::new(data));
+        let binary = Self::to_binary_pgp(data)?;
+        let parser = PacketParser::new(std::io::BufReader::new(binary.as_ref()));
         for packet_result in parser {
             let packet = packet_result.map_err(|e| CryptoError::Decrypt(e.to_string()))?;
 
@@ -502,7 +527,8 @@ impl OpenPgpCrypto for RpgpCrypto {
             key: (*session_key.data).clone(),
         };
 
-        let msg = pgp::composed::Message::from_bytes(std::io::BufReader::new(data))
+        let binary = Self::to_binary_pgp(data)?;
+        let msg = pgp::composed::Message::from_bytes(std::io::BufReader::new(binary.as_ref()))
             .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
 
         let mut decrypted = msg
@@ -887,6 +913,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovered.data, session_key.data);
+    }
+
+    /// RFC 4880 ASCII-armor a binary OpenPGP packet stream as a PGP MESSAGE
+    /// block — exactly the shape Proton delivers NodePassphrase / NodeHashKey in.
+    fn armor_pgp_message(binary: &[u8]) -> String {
+        use base64::Engine;
+
+        fn crc24(data: &[u8]) -> u32 {
+            let mut crc: u32 = 0x00B7_04CE;
+            for &b in data {
+                crc ^= (b as u32) << 16;
+                for _ in 0..8 {
+                    crc <<= 1;
+                    if crc & 0x0100_0000 != 0 {
+                        crc ^= 0x0186_4CFB;
+                    }
+                }
+            }
+            crc & 0x00FF_FFFF
+        }
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(binary);
+        let crc = crc24(binary);
+        let crc_bytes = [(crc >> 16) as u8, (crc >> 8) as u8, crc as u8];
+        let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc_bytes);
+
+        let mut out = String::from("-----BEGIN PGP MESSAGE-----\n\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(chunk).unwrap());
+            out.push('\n');
+        }
+        out.push('=');
+        out.push_str(&crc_b64);
+        out.push('\n');
+        out.push_str("-----END PGP MESSAGE-----\n");
+        out
+    }
+
+    /// Proton delivers PKESK and encrypted-message fields as ASCII-armored text
+    /// (OpenAPI `PGPMessage` = "An armored PGP Message"), but rpgp's PacketParser /
+    /// Message::from_bytes are binary-only. `to_binary_pgp` must dearmor first.
+    /// This locks in that path end-to-end on armored input.
+    #[tokio::test]
+    async fn decrypt_accepts_armored_input() {
+        let crypto = RpgpCrypto::new();
+        let plaintext = b"armored wire payload";
+        let (priv_key, pub_armored) = crypto
+            .generate_key("armor-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let pub_key = PublicKey {
+            armored: pub_armored,
+            fingerprint_hex: priv_key.fingerprint_hex.clone(),
+        };
+        let session_key = crypto
+            .generate_session_key(&[pub_key.clone()], EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let pkesk_binary = crypto
+            .encrypt_session_key(&session_key, &[pub_key.clone()])
+            .await
+            .unwrap();
+        let msg_binary = crypto
+            .encrypt_and_sign(
+                plaintext,
+                &session_key,
+                &[pub_key.clone()],
+                &priv_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        // Re-frame both binary blobs as armored text, mirroring the real wire.
+        let pkesk_armored = armor_pgp_message(&pkesk_binary);
+        let msg_armored = armor_pgp_message(&msg_binary);
+        assert!(pkesk_armored.starts_with("-----BEGIN PGP MESSAGE-----"));
+
+        let unlocked = crypto
+            .decrypt_key(&priv_key.armored, "armor-pass")
+            .await
+            .unwrap();
+        let recovered_sk = crypto
+            .decrypt_session_key(pkesk_armored.as_bytes(), &[unlocked])
+            .await
+            .unwrap();
+        assert_eq!(recovered_sk.data, session_key.data);
+
+        let (decrypted, status) = crypto
+            .decrypt_and_verify(msg_armored.as_bytes(), &recovered_sk, &[pub_key])
+            .await
+            .unwrap();
+        assert_eq!(decrypted, plaintext);
+        assert_eq!(status, VerificationStatus::Ok);
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use bytes::Bytes;
+use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -196,28 +197,10 @@ impl ProtonFileUploader {
         let address_email = self.account.primary_email().to_owned();
         let address_priv = self.account.address_private_key(&address_email).await?;
 
-        let address_pub = {
-            // Parse the private key's armored form to extract the public key.
-            // We need a PublicKey from the private key. Extract via decrypt_key
-            // to get the fingerprint, then use the armored private as armored public
-            // (rpgp supports parsing either).
-            // Actually we need the public armored form. Generate a PublicKey value
-            // from the address_priv armored key by parsing and re-exporting.
-            // For now, construct PublicKey with the same armored text —
-            // rpgp's `parse_public_key` will skip the secret-key packets and
-            // use the embedded public key material.
-            //
-            // FIXME: This is a workaround. Ideally ProtonDriveAccount exposes
-            // `address_public_key()`. rpgp's `SignedSecretKey::signed_public_key()`
-            // produces the public key — but here we only have the armored string.
-            // We pass the private key armored as the "public" key; rpgp's
-            // `SignedPublicKey::from_armor_single` accepts armored secret keys
-            // and extracts the public portion.
-            PublicKey {
-                armored: address_priv.armored.clone(),
-                fingerprint_hex: address_priv.fingerprint_hex.clone(),
-            }
-        };
+        // Derive the address public key from the private key. A secret-key
+        // armor is not a valid public-key armor, so we must re-export the
+        // public portion rather than reuse the private armored text.
+        let address_pub = self.openpgp.public_key(&address_priv).await?;
 
         // ── step 1: generate node crypto ─────────────────────────────────────
         let node_passphrase = self.openpgp.generate_passphrase();
@@ -232,16 +215,11 @@ impl ProtonFileUploader {
             fingerprint_hex: node_priv.fingerprint_hex.clone(),
         };
 
-        // Encrypt node passphrase to parent node key (parent.volume_id is share_id;
-        // we use share key here) + sign with address key.
-        // Obtain parent node key: fetch parent link and decrypt its passphrase.
-        // For MVP, we fetch the parent share key to decrypt the parent node passphrase.
-        let parent_node_priv = self.resolve_parent_node_key(share_id).await?;
+        // Resolve the parent folder's node key (to encrypt the new node's
+        // passphrase to) and its decrypted hash key (to compute the name hash).
+        let (parent_node_priv, parent_hash_key) = self.resolve_parent_context(share_id).await?;
 
-        let parent_node_pub = PublicKey {
-            armored: parent_node_priv.armored.clone(),
-            fingerprint_hex: parent_node_priv.fingerprint_hex.clone(),
-        };
+        let parent_node_pub = self.openpgp.public_key(&parent_node_priv).await?;
 
         // Encrypt the new node's passphrase to the parent node key.
         let node_passphrase_bytes = node_passphrase.as_bytes();
@@ -315,16 +293,15 @@ impl ProtonFileUploader {
             base64::engine::general_purpose::STANDARD.encode(&encrypted_name_bytes);
 
         // Name hash: HMAC-SHA256(parent_hash_key, name_bytes) → hex.
-        // For MVP we use SHA256(name_bytes) as parent hash key is not yet
-        // resolved from the parent node. This will fail server-side validation
-        // until full parent hash key resolution is implemented.
-        //
-        // FIXME: need parent node's NodeHashKey (FolderProperties.NodeHashKey)
-        // decrypted to compute the proper HMAC. For now fall back to SHA256(name).
+        // Mirrors JS `generateLookupHash` (driveCrypto.ts): the key is the
+        // parent folder's decrypted NodeHashKey bytes; the message is the
+        // UTF-8 file name. The server validates this against the parent's
+        // hash-key namespace, so a wrong key yields HTTP 422.
         let name_hash_hex = {
-            let mut hasher = Sha256::new();
-            hasher.update(self.name.as_bytes());
-            hex::encode(hasher.finalize())
+            let mut mac = <Hmac<Sha256>>::new_from_slice(&parent_hash_key)
+                .map_err(|e| Error::Internal(format!("HMAC key init: {e}")))?;
+            mac.update(self.name.as_bytes());
+            hex::encode(mac.finalize().into_bytes())
         };
 
         // ── step 2: POST create file node ─────────────────────────────────────
@@ -356,6 +333,7 @@ impl ProtonFileUploader {
 
         // ── step 4: read stream, chunk into 4 MiB blocks, encrypt each ────────
         let mut blocks: Vec<EncryptedBlock> = Vec::new();
+        let mut block_sizes: Vec<u64> = Vec::new();
         let mut sha1_hasher = Sha1::new();
         let mut total_bytes: u64 = 0;
         let mut block_index: u32 = 0;
@@ -393,6 +371,7 @@ impl ProtonFileUploader {
             let plaintext_block = &buf[..read_bytes];
             sha1_hasher.update(plaintext_block);
             total_bytes += read_bytes as u64;
+            block_sizes.push(read_bytes as u64);
 
             // Encrypt block with content session key (no PKESK for blocks —
             // bare SEIPD per ADR-0008).
@@ -548,7 +527,12 @@ impl ProtonFileUploader {
         // ── step 8: compute XAttr ─────────────────────────────────────────────
         let sha1_hex = hex::encode(sha1_hasher.finalize());
 
-        let xattr_json = build_xattr_json(total_bytes, &sha1_hex, self.metadata.modification_time);
+        let xattr_json = build_xattr_json(
+            total_bytes,
+            &block_sizes,
+            &sha1_hex,
+            self.metadata.modification_time,
+        );
 
         let xattr_session_key = self
             .openpgp
@@ -606,65 +590,108 @@ impl ProtonFileUploader {
         Ok(env.inner.share.volume_id)
     }
 
-    /// Resolve the parent folder's node private key for passphrase encryption.
+    /// Resolve the parent folder's node private key and its decrypted hash key.
     ///
-    /// Fetches the share root key via `GET drive/shares/{shareID}` and decrypts
-    /// it using the account key password. This is a simplified MVP approach:
-    /// full implementation would fetch the parent link, decrypt its passphrase
-    /// with the share key, then unlock its node key.
+    /// Mirrors the download key chain plus JS `getNodeKeys`:
+    ///   1. `GET drive/shares/{shareID}` → decrypt the share key with the
+    ///      address key (address → share passphrase → share private key).
+    ///   2. `GET drive/shares/{shareID}/links/{parentLinkID}` → decrypt the
+    ///      parent node key with the share key (the new node's passphrase is
+    ///      encrypted to the parent NODE key, not the share key).
+    ///   3. Decrypt the parent's `FolderProperties.NodeHashKey` with the parent
+    ///      node key → the HMAC key used to compute child name hashes.
     ///
-    /// FIXME: This only works correctly when `parent.node_id` is the share root.
-    /// For nested folders, we would need to walk the ancestor chain.
-    async fn resolve_parent_node_key(
+    /// MVP restriction: only correct when `parent.node_id` is the share root.
+    /// Nested folders need an ancestor-chain walk (deferred).
+    async fn resolve_parent_context(
         &self,
         share_id: &str,
-    ) -> Result<proton_drive_crypto::PrivateKey> {
-        let path = format!("/drive/shares/{share_id}");
-        let req = JsonRequest {
-            method: HttpMethod::Get,
-            path,
-            query: vec![],
-            headers: vec![],
-            body: None,
+    ) -> Result<(proton_drive_crypto::PrivateKey, Vec<u8>)> {
+        // ── share key ─────────────────────────────────────────────────────────
+        let share: proton_drive_api::shares::Share = {
+            let resp = self
+                .http
+                .request_json(JsonRequest {
+                    method: HttpMethod::Get,
+                    path: format!("/drive/shares/{share_id}"),
+                    query: vec![],
+                    headers: vec![],
+                    body: None,
+                })
+                .await?;
+            let env: ResponseEnvelope<proton_drive_api::shares::GetShareResponse> =
+                serde_json::from_slice(&resp.body)
+                    .map_err(|e| Error::Internal(format!("share JSON parse: {e}")))?;
+            if env.code != CODE_OK {
+                return Err(map_api_error(env.code, env.error));
+            }
+            env.inner.share
         };
-        let resp = self.http.request_json(req).await?;
-        let env: ResponseEnvelope<proton_drive_api::shares::GetShareResponse> =
-            serde_json::from_slice(&resp.body)
-                .map_err(|e| Error::Internal(format!("share JSON parse: {e}")))?;
-        if env.code != CODE_OK {
-            return Err(map_api_error(env.code, env.error));
-        }
-        let share = env.inner.share;
 
-        // Decrypt share passphrase with address private key to get share key.
         let address_email = self.account.primary_email().to_owned();
         let address_priv = self.account.address_private_key(&address_email).await?;
 
-        // Decode base64 passphrase (armored PGP message).
-        let passphrase_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&share.passphrase)
-            .or_else(|_| Ok::<Vec<u8>, Error>(share.passphrase.as_bytes().to_vec()))?;
+        let share_priv = crate::download::decrypt_share_key(
+            &self.openpgp,
+            &share.key,
+            &share.passphrase,
+            &address_priv,
+        )
+        .await?;
 
-        let share_passphrase_session_key = self
+        // ── parent link → parent node key ──────────────────────────────────────
+        let parent_link_id = &self.parent.node_id;
+        let link: proton_drive_api::nodes::Link = {
+            let resp = self
+                .http
+                .request_json(JsonRequest {
+                    method: HttpMethod::Get,
+                    path: format!("/drive/shares/{share_id}/links/{parent_link_id}"),
+                    query: vec![],
+                    headers: vec![],
+                    body: None,
+                })
+                .await?;
+            let env: ResponseEnvelope<proton_drive_api::nodes::GetLinkResponse> =
+                serde_json::from_slice(&resp.body)
+                    .map_err(|e| Error::Internal(format!("parent link JSON parse: {e}")))?;
+            if env.code != CODE_OK {
+                return Err(map_api_error(env.code, env.error));
+            }
+            env.inner.link
+        };
+
+        let parent_node_priv = crate::download::decrypt_node_private_key(
+            &self.openpgp,
+            &link.node_key,
+            &link.node_passphrase,
+            &share_priv,
+        )
+        .await?;
+
+        // ── parent node hash key ────────────────────────────────────────────────
+        let node_hash_key_armored = link
+            .folder_properties
+            .as_ref()
+            .and_then(|f| f.node_hash_key.as_ref())
+            .ok_or_else(|| {
+                Error::Internal("parent link is not a folder or has no NodeHashKey".into())
+            })?;
+
+        // NodeHashKey is an armored PGP message (PGPMessage). The crypto layer
+        // dearmors transparently. JS `decryptNodeHashKey` does not require the
+        // signature to verify — we only need the plaintext key bytes.
+        let hash_key_bytes = node_hash_key_armored.as_bytes();
+        let hash_key_session_key = self
             .openpgp
-            .decrypt_session_key(&passphrase_bytes, std::slice::from_ref(&address_priv))
+            .decrypt_session_key(hash_key_bytes, std::slice::from_ref(&parent_node_priv))
+            .await?;
+        let (parent_hash_key, _status) = self
+            .openpgp
+            .decrypt_and_verify(hash_key_bytes, &hash_key_session_key, &[])
             .await?;
 
-        let (share_passphrase_bytes, _status) = self
-            .openpgp
-            .decrypt_and_verify(&passphrase_bytes, &share_passphrase_session_key, &[])
-            .await?;
-
-        let share_passphrase_str = String::from_utf8(share_passphrase_bytes)
-            .map_err(|e| Error::Internal(format!("share passphrase not UTF-8: {e}")))?;
-
-        // Unlock share key using the decrypted passphrase.
-        let share_priv = self
-            .openpgp
-            .decrypt_key(&share.key, &share_passphrase_str)
-            .await?;
-
-        Ok(share_priv)
+        Ok((parent_node_priv, parent_hash_key))
     }
 
     /// Fetch the server-supplied verification code for a revision draft.
@@ -820,22 +847,68 @@ impl ProtonFileUploader {
 
 // ── XAttr builder ─────────────────────────────────────────────────────────────
 
+/// Build the file extended-attributes JSON, mirroring JS
+/// `generateFileExtendedAttributes` (extendedAttributes.ts):
+///   `{"Common":{"ModificationTime":<ISO-8601>,"Size":N,"BlockSizes":[...],
+///     "Digests":{"SHA1":"<hex>"}}}`.
+/// `ModificationTime` is omitted when no (valid) time is supplied. JSON key
+/// order is irrelevant — the XAttr is encrypted and re-parsed, never byte-compared.
 fn build_xattr_json(
     size_bytes: u64,
+    block_sizes: &[u64],
     sha1_hex: &str,
     modification_time: Option<SystemTime>,
 ) -> String {
-    let modification_time_unix = modification_time
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
-
-    if let Some(mtime) = modification_time_unix {
-        format!(
-            r#"{{"Common":{{"ModificationTime":{mtime},"Size":{size_bytes},"Digests":{{"SHA1":"{sha1_hex}"}}}}}}"#
-        )
-    } else {
-        format!(r#"{{"Common":{{"Size":{size_bytes},"Digests":{{"SHA1":"{sha1_hex}"}}}}}}"#)
+    let mut common = serde_json::Map::new();
+    if let Some(iso) = modification_time.and_then(system_time_to_iso8601) {
+        common.insert(
+            "ModificationTime".to_owned(),
+            serde_json::Value::String(iso),
+        );
     }
+    common.insert("Size".to_owned(), serde_json::json!(size_bytes));
+    common.insert("BlockSizes".to_owned(), serde_json::json!(block_sizes));
+    common.insert(
+        "Digests".to_owned(),
+        serde_json::json!({ "SHA1": sha1_hex }),
+    );
+    serde_json::json!({ "Common": serde_json::Value::Object(common) }).to_string()
+}
+
+/// Format a `SystemTime` as a UTC ISO-8601 string with millisecond precision
+/// and a `Z` suffix, matching JavaScript's `Date.prototype.toISOString()`.
+/// Returns `None` for times before the Unix epoch (JS treats those as invalid
+/// here and omits the field).
+fn system_time_to_iso8601(t: SystemTime) -> Option<String> {
+    let dur = t.duration_since(UNIX_EPOCH).ok()?;
+    let secs = dur.as_secs() as i64;
+    let millis = dur.subsec_millis();
+
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+
+    // civil_from_days (Howard Hinnant): days since epoch → (year, month, day).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year_civil = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 {
+        year_civil + 1
+    } else {
+        year_civil
+    };
+
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
+    ))
 }
 
 // ── Verification data DTO ─────────────────────────────────────────────────────
@@ -911,18 +984,21 @@ mod tests {
 
     #[test]
     fn xattr_json_with_mtime() {
+        // 1_700_000_000 s since epoch == 2023-11-14T22:13:20.000Z.
         let mtime = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let json = build_xattr_json(1234, "aabbcc", Some(mtime));
-        assert!(json.contains("\"ModificationTime\":1700000000"));
+        let json = build_xattr_json(1234, &[1000, 234], "aabbcc", Some(mtime));
+        assert!(json.contains("\"ModificationTime\":\"2023-11-14T22:13:20.000Z\""));
         assert!(json.contains("\"Size\":1234"));
+        assert!(json.contains("\"BlockSizes\":[1000,234]"));
         assert!(json.contains("\"SHA1\":\"aabbcc\""));
     }
 
     #[test]
     fn xattr_json_without_mtime() {
-        let json = build_xattr_json(5678, "ddeeff", None);
+        let json = build_xattr_json(5678, &[5678], "ddeeff", None);
         assert!(!json.contains("ModificationTime"));
         assert!(json.contains("\"Size\":5678"));
+        assert!(json.contains("\"BlockSizes\":[5678]"));
     }
 
     // ── Mock-HTTP protocol flow test ──────────────────────────────────────────
@@ -1155,13 +1231,14 @@ mod tests {
         use crate::nodes::make_node_uid;
 
         // Build mock HTTP responses in the expected call order:
-        // 1. GET /drive/shares/{shareID}  → resolve volume_id
-        // 2. GET /drive/shares/{shareID}  → resolve parent node key (share key)
-        // 3. GET /drive/v2/volumes/.../verification  → verification code
-        // 4. POST /drive/v2/volumes/.../files  → create file
-        // 5. POST /drive/blocks  → request block upload tokens
-        // 6. POST <bare_url>  → upload block (BlobRequest)
-        // 7. PUT /drive/v2/volumes/.../revisions/{revID}  → commit revision
+        // 1. GET /drive/shares/{shareID}            → resolve volume_id
+        // 2. GET /drive/shares/{shareID}            → parent context: share key
+        // 3. GET /drive/shares/{shareID}/links/{id} → parent context: node + hash key
+        // 4. POST /drive/v2/volumes/.../files       → create file
+        // 5. GET /drive/v2/volumes/.../verification → verification code
+        // 6. POST /drive/blocks                     → request block upload tokens
+        // 7. POST <bare_url>                        → upload block (BlobRequest)
+        // 8. PUT /drive/v2/volumes/.../revisions/{revID} → commit revision
 
         // `GET drive/shares/{shareID}` returns share fields flat at the envelope
         // level (no `Share` wrapper) — matches `GetShareResponse`'s flatten.
@@ -1178,6 +1255,31 @@ mod tests {
             "AddressKeyID": "key-001"
         });
         let share_bytes = serde_json::to_vec(&share_resp).unwrap();
+
+        // Parent link (the share root folder). `decrypt_node_private_key`
+        // base64-decodes NodePassphrase; the FakeCrypto strips the `FAKE_ENC:`
+        // marker. `FolderProperties.NodeHashKey` is the (fake-encrypted) hash
+        // key the uploader decrypts to seed the name-hash HMAC.
+        let link_resp = serde_json::json!({
+            "Code": 1000,
+            "Link": {
+                "LinkID": "root-link",
+                "ParentLinkID": null,
+                "Type": 1,
+                "Name": "root",
+                "Hash": null,
+                "MIMEType": "Folder",
+                "State": 1,
+                "Size": 0,
+                "CreateTime": 0,
+                "ModifyTime": 0,
+                "NodeKey": "FAKE_NODE_KEY",
+                "NodePassphrase": base64::engine::general_purpose::STANDARD.encode("FAKE_ENC:my-node-passphrase"),
+                "NodePassphraseSignature": "SIG:fake",
+                "FolderProperties": { "NodeHashKey": "FAKE_ENC:my-hash-key" }
+            }
+        });
+        let link_bytes = serde_json::to_vec(&link_resp).unwrap();
 
         let verification_resp = serde_json::json!({
             "Code": 1000,
@@ -1214,13 +1316,14 @@ mod tests {
         let commit_bytes = serde_json::to_vec(&commit_resp).unwrap();
 
         let http = Arc::new(FakeHttpClient::new(vec![
-            (200, share_bytes.clone()), // step 0a: resolve volume_id
-            (200, share_bytes.clone()), // step 0b: resolve parent node key
-            (200, create_file_bytes),   // step 2: POST create file
-            (200, verification_bytes),  // step 3: GET verification code
-            (200, block_req_bytes),     // step 5: POST request blocks
-            (200, block_upload_bytes),  // step 6: PUT block blob
-            (200, commit_bytes),        // step 9: PUT commit revision
+            (200, share_bytes.clone()), // 1: resolve volume_id
+            (200, share_bytes.clone()), // 2: parent context — share key
+            (200, link_bytes),          // 3: parent context — node + hash key
+            (200, create_file_bytes),   // 4: POST create file
+            (200, verification_bytes),  // 5: GET verification code
+            (200, block_req_bytes),     // 6: POST request blocks
+            (200, block_upload_bytes),  // 7: PUT block blob
+            (200, commit_bytes),        // 8: PUT commit revision
         ]));
 
         let openpgp = Arc::new(FakeCrypto);
@@ -1257,31 +1360,32 @@ mod tests {
         let paths = http.recorded_paths();
         assert!(
             paths[0].contains("/drive/shares/share-abc"),
-            "step 0a: {}",
+            "1 resolve volume: {}",
             paths[0]
         );
         assert!(
             paths[1].contains("/drive/shares/share-abc"),
-            "step 0b: {}",
+            "2 parent share: {}",
             paths[1]
         );
         assert!(
-            paths[2].contains("/files"),
-            "step 2 create file: {}",
+            paths[2].contains("/drive/shares/share-abc/links/root-link"),
+            "3 parent link: {}",
             paths[2]
         );
-        assert!(paths[3].contains("/verification"), "step 3: {}", paths[3]);
+        assert!(paths[3].contains("/files"), "4 create file: {}", paths[3]);
         assert!(
-            paths[4].contains("/drive/blocks"),
-            "step 5 request blocks: {}",
+            paths[4].contains("/verification"),
+            "5 verification: {}",
             paths[4]
         );
-        // paths[5] is the blob upload path (bare_url)
         assert!(
-            paths[6].contains("/revisions/"),
-            "step 9 commit: {}",
-            paths[6]
+            paths[5].contains("/drive/blocks"),
+            "6 request blocks: {}",
+            paths[5]
         );
+        // paths[6] is the blob upload path (bare_url)
+        assert!(paths[7].contains("/revisions/"), "8 commit: {}", paths[7]);
     }
 
     #[test]

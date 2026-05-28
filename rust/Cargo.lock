@@ -2133,6 +2133,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "hmac",
  "proton-drive-api",
  "proton-drive-cache",
  "proton-drive-crypto",

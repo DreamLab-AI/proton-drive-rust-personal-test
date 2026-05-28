@@ -507,9 +507,12 @@ pub async fn decrypt_node_private_key(
     parent_key: &PrivateKey,
 ) -> Result<PrivateKey> {
     // Decrypt the node passphrase by using parent key to unwrap PKESK.
+    // NodePassphrase is an armored PGPMessage on the wire; older callers may
+    // pass base64-encoded binary. Try base64 first, else use the raw bytes —
+    // the crypto layer dearmors armored input transparently.
     let ckp_bytes = base64::engine::general_purpose::STANDARD
         .decode(node_passphrase_encrypted_b64)
-        .map_err(|e| Error::Internal(format!("NodePassphrase base64: {e}")))?;
+        .unwrap_or_else(|_| node_passphrase_encrypted_b64.as_bytes().to_vec());
 
     let passphrase_session_key = crypto
         .decrypt_session_key(&ckp_bytes, std::slice::from_ref(parent_key))
@@ -541,9 +544,11 @@ pub async fn decrypt_share_key(
     share_passphrase_encrypted_b64: &str,
     address_key: &PrivateKey,
 ) -> Result<PrivateKey> {
+    // Share Passphrase is an armored PGPMessage on the wire; older callers may
+    // pass base64-encoded binary. Try base64 first, else use the raw bytes.
     let pp_bytes = base64::engine::general_purpose::STANDARD
         .decode(share_passphrase_encrypted_b64)
-        .map_err(|e| Error::Internal(format!("share passphrase base64: {e}")))?;
+        .unwrap_or_else(|_| share_passphrase_encrypted_b64.as_bytes().to_vec());
 
     let pp_session_key = crypto
         .decrypt_session_key(&pp_bytes, std::slice::from_ref(address_key))
