@@ -62,6 +62,41 @@ pub mod user {
     }
 }
 
+pub mod addresses {
+    use super::*;
+
+    /// Response from `GET /core/v4/addresses`.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct GetAddressesResponse {
+        pub addresses: Vec<Address>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct Address {
+        #[serde(rename = "ID")]
+        pub id: String,
+        pub email: String,
+        /// Sort order — the primary address has the lowest value.
+        pub order: u32,
+        pub keys: Vec<AddressKey>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct AddressKey {
+        #[serde(rename = "ID")]
+        pub id: String,
+        pub primary: u8,
+        pub private_key: String,
+        /// Armored PGP message: the address-key passphrase encrypted to one of
+        /// the user's keys. Absent for some legacy key layouts.
+        #[serde(default)]
+        pub token: Option<String>,
+    }
+}
+
 pub mod shares {
     use super::*;
 

@@ -39,6 +39,8 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 thiserror.workspace = true
+futures.workspace = true
 proton-drive = { path = "../../crates/proton-drive" }
 proton-drive-api = { path = "../../crates/proton-drive-api" }
+proton-drive-cache = { path = "../../crates/proton-drive-cache" }
 proton-drive-crypto = { path = "../../crates/proton-drive-crypto" }

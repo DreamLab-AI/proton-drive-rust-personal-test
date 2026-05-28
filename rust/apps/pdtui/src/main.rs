@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod account;
 mod app;
 mod auth;
 mod http;

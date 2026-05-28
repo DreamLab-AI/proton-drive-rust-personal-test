@@ -12,11 +12,20 @@ use tracing::{debug, warn};
 
 use zeroize::Zeroizing;
 
+use crate::account::PdtuiAccount;
 use crate::auth::{self, AuthError, Credentials};
+use crate::http::SessionAwareHttpClient;
 use crate::keymap::{Action, dispatch};
-use crate::panes::{Focus, Panes};
-use crate::session;
+use crate::panes::{Focus, PaneEntry, Panes};
+use crate::session::{self, SessionManager};
 use crate::transfer::{Transfer, spawn_download, spawn_upload};
+
+use futures::StreamExt as _;
+use proton_drive::{
+    FolderChildrenFilter, MaybeNode, NodeType, ProtonDriveClient, ProtonDriveClientOptions,
+    ProtonDriveConfig, ProtonDriveHttpClient, RpgpCrypto,
+};
+use proton_drive_cache::MemoryCache;
 
 const BASE_URL: &str = "https://drive.proton.me/api";
 
@@ -74,8 +83,12 @@ pub struct App {
     pub status: Option<String>,
     /// Active or recently finished transfers — capped at 8 for MVP.
     pub transfers: Vec<Transfer>,
-    /// Shared client, set after a successful login.
-    client: Option<Arc<proton_drive::ProtonDriveClient>>,
+    /// Shared client, set after a successful login or session resume.
+    client: Option<Arc<ProtonDriveClient>>,
+    /// Owns the background token-refresh task; held so it is not dropped while
+    /// the client is in use.
+    #[allow(dead_code)]
+    session: Option<Arc<SessionManager>>,
 }
 
 impl App {
@@ -93,6 +106,7 @@ impl App {
             status: None,
             transfers: Vec::new(),
             client: None,
+            session: None,
         }
     }
 
@@ -100,6 +114,17 @@ impl App {
         &mut self,
         term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> io::Result<()> {
+        // Resume a persisted session on startup so F2/F3 work without a fresh
+        // login. Failures (no keyring entry, expired token) are non-fatal — the
+        // user can log in via F4.
+        if matches!(self.screen, Screen::Main) {
+            if let Err(e) = self.build_client_from_keyring().await {
+                debug!("session resume failed: {e}");
+                self.panes.remote.error =
+                    Some("session expired — press Enter or F4 to log in".into());
+            }
+        }
+
         while !self.should_quit {
             term.draw(|frame| {
                 crate::ui::render(
@@ -139,7 +164,7 @@ impl App {
                 let action = dispatch(k.code, k.modifiers);
                 debug!(?action, key = ?k.code, "key event");
                 self.status = None; // clear one-shot status on any keypress
-                self.apply(action);
+                self.apply(action).await;
             }
         }
         Ok(())
@@ -253,10 +278,13 @@ impl App {
                 if let Err(e) = auth::write_session_file(&creds) {
                     warn!("session file write failed: {e}");
                 }
-                self.panes.remote.error =
-                    Some("authenticated — remote listing wires up in M7".into());
                 self.status = Some(format!("logged in as {username}"));
                 self.screen = Screen::Main;
+                if let Err(e) = self.build_client_from_login(creds).await {
+                    warn!("client build after login failed: {e}");
+                    self.panes.remote.error = Some(format!("listing failed: {e}"));
+                    self.status = Some(format!("logged in as {username} (listing failed)"));
+                }
             }
             Ok(Err(e)) => {
                 let mut form = LoginForm::new();
@@ -275,7 +303,7 @@ impl App {
     // Main-screen actions
     // -----------------------------------------------------------------------
 
-    fn apply(&mut self, action: Action) {
+    async fn apply(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Login => self.screen = Screen::Login(LoginForm::new()),
@@ -284,23 +312,80 @@ impl App {
                     Focus::Local => Focus::Remote,
                     Focus::Remote => Focus::Local,
                 };
+                // Focusing the remote pane refreshes it if a client exists but
+                // nothing has been listed yet.
+                if self.focus == Focus::Remote
+                    && self.client.is_some()
+                    && self.panes.remote.entries.is_empty()
+                {
+                    self.refresh_remote().await;
+                }
             }
             Action::Up => self.panes.cursor_up(self.focus),
             Action::Down => self.panes.cursor_down(self.focus),
             Action::Enter => {
-                if self.focus == Focus::Remote && self.panes.remote.error.is_some() {
-                    self.screen = Screen::Login(LoginForm::new());
+                if self.focus == Focus::Remote {
+                    if self.client.is_none() {
+                        self.screen = Screen::Login(LoginForm::new());
+                    } else {
+                        self.descend_remote().await;
+                    }
                 } else {
                     self.panes.descend(self.focus);
                 }
             }
-            Action::Parent => self.panes.ascend(self.focus),
-            Action::Refresh => self.panes.refresh(self.focus),
+            Action::Parent => {
+                if self.focus == Focus::Remote {
+                    self.ascend_remote().await;
+                } else {
+                    self.panes.ascend(self.focus);
+                }
+            }
+            Action::Refresh => {
+                if self.focus == Focus::Remote && self.client.is_some() {
+                    self.refresh_remote().await;
+                } else {
+                    self.panes.refresh(self.focus);
+                }
+            }
             Action::Upload => self.start_upload(),
             Action::Download => self.start_download(),
             Action::Help | Action::None => {}
             Action::ToggleSelect => self.panes.toggle_select(self.focus),
         }
+    }
+
+    /// Descend into the remote folder under the cursor (re-lists its children).
+    async fn descend_remote(&mut self) {
+        let entry = self
+            .panes
+            .remote
+            .entries
+            .get(self.panes.remote.cursor)
+            .cloned();
+        let Some(entry) = entry else {
+            return;
+        };
+        if !entry.is_dir {
+            return;
+        }
+        let Some(uid) = entry.node_uid else {
+            return;
+        };
+        self.panes.remote.remote_cwd_uid = Some(uid);
+        self.panes.remote.cursor = 0;
+        self.refresh_remote().await;
+    }
+
+    /// Re-list the My Files root (MVP: a flat back-to-root, since parent UIDs
+    /// for arbitrary nesting are not tracked yet).
+    ///
+    /// FIXME: full parent-stack navigation needs the listing to expose each
+    /// node's parent NodeUid; for MVP "parent" returns to the My Files root.
+    async fn ascend_remote(&mut self) {
+        self.panes.remote.remote_cwd_uid = None;
+        self.panes.remote.cursor = 0;
+        self.refresh_remote().await;
     }
 
     // -----------------------------------------------------------------------
@@ -352,27 +437,172 @@ impl App {
         self.transfers.push(transfer);
     }
 
-    /// Called after a successful login to build the `ProtonDriveClient`.
-    ///
-    /// # FIXME
-    /// Full client construction requires crypto (rpgp), account keys, and
-    /// cache wiring — those dependencies belong to a session-setup module
-    /// not yet landed (M7).  For now we leave `self.client = None` and
-    /// surface "not authenticated" when the user presses F2/F3.
-    ///
-    /// When M7 lands: call `build_client_from_session` here and store the
-    /// result in `self.client`.
-    #[allow(dead_code)]
-    fn try_build_client(&mut self) {
-        // FIXME: build ProtonDriveClient from session credentials once M7
-        // (full session wiring) lands.  The upload/download paths are fully
-        // coded and will work once this method populates self.client.
+    // -----------------------------------------------------------------------
+    // Client construction (account key-unlock + SDK wiring)
+    // -----------------------------------------------------------------------
+
+    /// Build the `ProtonDriveClient` from freshly-obtained login credentials.
+    async fn build_client_from_login(&mut self, creds: Credentials) -> Result<(), String> {
+        let app_version = format!("external-drive-pdtui@{}-stable", proton_drive::VERSION);
+        let transport: Arc<dyn ProtonDriveHttpClient> = Arc::new(
+            crate::http::ReqwestHttpClient::new(BASE_URL, &app_version)
+                .map_err(|e| format!("http client: {e}"))?,
+        );
+
+        // Proton does not return an explicit expiry on login; 30 min is the
+        // conservative default used by the refresh path.
+        let session = SessionManager::from_login(
+            Arc::clone(&transport),
+            creds.uid.clone(),
+            creds.access_token.clone(),
+            creds.refresh_token.clone(),
+            creds.key_password.clone(),
+            30 * 60,
+        )
+        .await
+        .map_err(|e| format!("session manager: {e}"))?;
+
+        self.build_client_with_session(
+            transport,
+            Arc::new(session),
+            creds.user_id.clone(),
+            creds.key_password.clone(),
+        )
+        .await
     }
 
-    // Exposed for tests.
-    #[cfg(test)]
-    pub fn set_client(&mut self, client: Arc<proton_drive::ProtonDriveClient>) {
-        self.client = Some(client);
+    /// Resume a persisted session and build the client. Returns an error if no
+    /// session is stored or the token cannot be resumed.
+    async fn build_client_from_keyring(&mut self) -> Result<(), String> {
+        let app_version = format!("external-drive-pdtui@{}-stable", proton_drive::VERSION);
+        let transport: Arc<dyn ProtonDriveHttpClient> = Arc::new(
+            crate::http::ReqwestHttpClient::new(BASE_URL, &app_version)
+                .map_err(|e| format!("http client: {e}"))?,
+        );
+
+        let session = SessionManager::from_keyring(Arc::clone(&transport))
+            .await
+            .map_err(|e| format!("session resume: {e}"))?;
+        let key_password = session.key_password().await;
+
+        // The persisted session does not carry the user id; `PdtuiAccount`
+        // fetches it from /core/v4/users, so an empty seed is acceptable here.
+        let user_id = String::new();
+
+        self.build_client_with_session(transport, Arc::new(session), user_id, key_password)
+            .await
+    }
+
+    /// Shared client assembly: wrap the transport in a `SessionAwareHttpClient`,
+    /// bootstrap the account (key-unlock chain), construct the SDK client, then
+    /// populate the remote pane with a live listing.
+    async fn build_client_with_session(
+        &mut self,
+        transport: Arc<dyn ProtonDriveHttpClient>,
+        session: Arc<SessionManager>,
+        seed_user_id: String,
+        key_password: zeroize::Zeroizing<String>,
+    ) -> Result<(), String> {
+        let http: Arc<dyn ProtonDriveHttpClient> =
+            Arc::new(SessionAwareHttpClient::new(transport, Arc::clone(&session)));
+        let crypto = Arc::new(RpgpCrypto::new());
+
+        let account = PdtuiAccount::bootstrap(
+            Arc::clone(&http),
+            Arc::clone(&crypto) as Arc<dyn proton_drive::OpenPgpCrypto>,
+            seed_user_id,
+            key_password,
+        )
+        .await
+        .map_err(|e| format!("account bootstrap: {e}"))?;
+
+        let entities_cache = Arc::new(MemoryCache::<String>::new());
+        let crypto_cache = Arc::new(MemoryCache::<proton_drive::CachedCryptoMaterial>::new());
+
+        let opts = ProtonDriveClientOptions {
+            http_client: http,
+            entities_cache,
+            crypto_cache,
+            account: Arc::new(account),
+            openpgp: Arc::clone(&crypto) as Arc<dyn proton_drive::OpenPgpCrypto>,
+            srp: crypto as Arc<dyn proton_drive::SrpModule>,
+            config: ProtonDriveConfig::default(),
+            telemetry: None,
+            latest_event_id: None,
+        };
+
+        let client = Arc::new(ProtonDriveClient::new(opts));
+        self.client = Some(Arc::clone(&client));
+        self.session = Some(session);
+
+        self.refresh_remote().await;
+        Ok(())
+    }
+
+    /// List the remote folder currently shown (root if none yet) and populate
+    /// the remote pane. Sets each entry's `node_uid` and `remote_cwd_uid`.
+    async fn refresh_remote(&mut self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+
+        // Determine the folder to list: the current remote cwd, or the My Files
+        // root if we have not listed anything yet.
+        let folder_uid = match self.panes.remote.remote_cwd_uid.clone() {
+            Some(uid) => uid,
+            None => match client.my_files_root().await {
+                Ok(node) => node.uid().clone(),
+                Err(e) => {
+                    self.panes.remote.error = Some(format!("my-files root: {e}"));
+                    return;
+                }
+            },
+        };
+
+        let mut entries: Vec<PaneEntry> = Vec::new();
+        let mut stream = client.iter_folder_children(&folder_uid, FolderChildrenFilter::default());
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MaybeNode::Node(node)) => {
+                    if node.trashed {
+                        continue;
+                    }
+                    let is_dir = matches!(node.node_type, NodeType::Folder | NodeType::Album);
+                    entries.push(PaneEntry {
+                        name: node.name.clone(),
+                        is_dir,
+                        size_bytes: node.size_bytes,
+                        selected: false,
+                        node_uid: Some(node.uid.clone()),
+                    });
+                }
+                Ok(MaybeNode::Degraded { uid, reason }) => {
+                    entries.push(PaneEntry {
+                        name: format!("<degraded {}: {reason}>", uid.node_id),
+                        is_dir: false,
+                        size_bytes: None,
+                        selected: false,
+                        node_uid: Some(uid),
+                    });
+                }
+                Ok(MaybeNode::Missing { .. }) => {}
+                Err(e) => {
+                    self.panes.remote.error = Some(format!("list: {e}"));
+                    return;
+                }
+            }
+        }
+
+        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.cmp(&b.name),
+        });
+
+        self.panes.remote.entries = entries;
+        self.panes.remote.cursor = 0;
+        self.panes.remote.remote_cwd_uid = Some(folder_uid);
+        self.panes.remote.error = None;
     }
 }
 
