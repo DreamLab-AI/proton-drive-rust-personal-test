@@ -23,12 +23,17 @@ use pgp::{
     },
     crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm},
     packet::{
-        PacketParser, PacketTrait, PublicKeyEncryptedSessionKey, SignatureConfig, SignatureType,
-        SymEncryptedProtectedData,
+        Notation, PacketParser, PacketTrait, PublicKeyEncryptedSessionKey, SignatureConfig,
+        SignatureType, Subpacket, SubpacketData, SymEncryptedProtectedData,
     },
     ser::Serialize,
-    types::{EskType, KeyDetails, Password, PublicKeyTrait},
+    types::{EskType, KeyDetails, Password, PkeskVersion, PublicKeyTrait},
 };
+
+/// Proton binds a signature to a purpose ("signature context") via a critical
+/// notation with this name. Matches gopenpgp / OpenPGP.js; a verifier that
+/// requires a different context value rejects the signature.
+const PROTON_SIGNATURE_CONTEXT_NOTATION: &[u8] = b"context@proton.ch";
 
 // ── error ─────────────────────────────────────────────────────────────────────
 
@@ -453,7 +458,13 @@ impl OpenPgpCrypto for RpgpCrypto {
             let values = pkesk
                 .values()
                 .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
-            let typ = EskType::V3_4;
+            // ESK type must match the PKESK packet version, not a hardcoded
+            // guess — a V6 PKESK decrypted as V3_4 (or vice-versa) fails.
+            let typ = match pkesk.version() {
+                PkeskVersion::V3 => EskType::V3_4,
+                PkeskVersion::V6 => EskType::V6,
+                PkeskVersion::Other(_) => continue,
+            };
 
             for priv_key in decryption_keys {
                 let key = Self::parse_secret_key(priv_key)?;
@@ -685,15 +696,48 @@ impl OpenPgpCrypto for RpgpCrypto {
         &self,
         data: &[u8],
         signing_key: &PrivateKey,
-        _signature_context: &str,
+        signature_context: &str,
     ) -> Result<Vec<u8>, CryptoError> {
         let key = Self::parse_secret_key(signing_key)?;
         let pw = Password::from(signing_key.passphrase.as_str());
 
         let mut rng = rand::thread_rng();
-        let sig_config =
+        let mut sig_config =
             SignatureConfig::from_key(&mut rng, &key.primary_key, SignatureType::Binary)
                 .map_err(|e| CryptoError::Key(e.to_string()))?;
+
+        // `from_key` leaves the subpacket sets empty; a v4 detached signature is
+        // only RFC-valid (and verifiable by OpenPGP.js / Proton) with a
+        // creation-time and an issuer subpacket.
+        let now = chrono::Utc::now();
+        let mut hashed = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(now))
+                .map_err(|e| CryptoError::Key(e.to_string()))?,
+            Subpacket::regular(SubpacketData::IssuerFingerprint(
+                key.primary_key.fingerprint(),
+            ))
+            .map_err(|e| CryptoError::Key(e.to_string()))?,
+        ];
+
+        // A non-empty context is bound into the signature as a critical notation
+        // (mirrors openPGPCrypto.ts `sign`). Empty context = no binding, matching
+        // `signArmored` / the detached block & manifest signatures.
+        if !signature_context.is_empty() {
+            hashed.push(
+                Subpacket::critical(SubpacketData::Notation(Notation {
+                    readable: true,
+                    name: PROTON_SIGNATURE_CONTEXT_NOTATION.to_vec().into(),
+                    value: signature_context.as_bytes().to_vec().into(),
+                }))
+                .map_err(|e| CryptoError::Key(e.to_string()))?,
+            );
+        }
+
+        sig_config.hashed_subpackets = hashed;
+        sig_config.unhashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::Issuer(key.primary_key.key_id()))
+                .map_err(|e| CryptoError::Key(e.to_string()))?,
+        ];
 
         let sig = sig_config
             .sign(&key.primary_key, &pw, std::io::Cursor::new(data))
@@ -864,11 +908,16 @@ mod tests {
             .decrypt_session_key(&encrypted, &[unlocked])
             .await
             .unwrap();
-        let (decrypted, _status) = crypto
+        let (decrypted, status) = crypto
             .decrypt_and_verify(&encrypted, &recovered_sk, &[pub_key])
             .await
             .unwrap();
         assert_eq!(decrypted, plaintext);
+        assert_eq!(
+            status,
+            VerificationStatus::Ok,
+            "embedded signature must verify (no double-wrap / lost signature)"
+        );
     }
 
     #[tokio::test]
@@ -890,5 +939,48 @@ mod tests {
         let sig = crypto.sign(data, &unlocked, "").await.unwrap();
         let status = crypto.verify(data, &sig, &[pub_key]).await.unwrap();
         assert_eq!(status, VerificationStatus::Ok);
+
+        // An empty context must NOT add a notation (matches signArmored).
+        let parsed = StandaloneSignature::from_bytes(std::io::Cursor::new(&sig)).unwrap();
+        assert!(
+            parsed.signature.notations().is_empty(),
+            "empty context must not embed a notation"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_embeds_critical_context_notation() {
+        let crypto = RpgpCrypto::new();
+        let data = b"key packet bytes";
+        let (priv_key, pub_armored) = crypto
+            .generate_key("ctx-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let pub_key = PublicKey {
+            armored: pub_armored,
+            fingerprint_hex: priv_key.fingerprint_hex.clone(),
+        };
+        let unlocked = crypto
+            .decrypt_key(&priv_key.armored, "ctx-pass")
+            .await
+            .unwrap();
+
+        let sig = crypto
+            .sign(data, &unlocked, "drive.sharing.member")
+            .await
+            .unwrap();
+
+        // Cryptographically valid even with the extra hashed subpackets.
+        let status = crypto.verify(data, &sig, &[pub_key]).await.unwrap();
+        assert_eq!(status, VerificationStatus::Ok);
+
+        // The context is bound as a critical `context@proton.ch` notation.
+        let parsed = StandaloneSignature::from_bytes(std::io::Cursor::new(&sig)).unwrap();
+        let notations = parsed.signature.notations();
+        let ctx = notations
+            .iter()
+            .find(|n| n.name.as_ref() == PROTON_SIGNATURE_CONTEXT_NOTATION)
+            .unwrap();
+        assert_eq!(ctx.value.as_ref(), b"drive.sharing.member");
     }
 }

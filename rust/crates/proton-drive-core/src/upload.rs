@@ -264,13 +264,11 @@ impl ProtonFileUploader {
 
         // Sign the node passphrase with address key (detached signature on
         // the armored encrypted passphrase bytes — matches JS `generateNodeKeys`).
+        // No signature context: JS `encryptPassphrase` signs the passphrase
+        // detached with no context notation.
         let passphrase_sig = self
             .openpgp
-            .sign(
-                &node_passphrase_encrypted,
-                &address_priv,
-                "drive.node.passphrase",
-            )
+            .sign(&node_passphrase_encrypted, &address_priv, "")
             .await?;
         let passphrase_sig_armored =
             base64::engine::general_purpose::STANDARD.encode(&passphrase_sig);
@@ -290,13 +288,10 @@ impl ProtonFileUploader {
             base64::engine::general_purpose::STANDARD.encode(&content_key_packet_bytes);
 
         // Sign the content key packet with the address key.
+        // No signature context: JS `generateContentKeys` uses `signArmored`.
         let content_key_sig = self
             .openpgp
-            .sign(
-                &content_key_packet_bytes,
-                &address_priv,
-                "drive.file.content-key",
-            )
+            .sign(&content_key_packet_bytes, &address_priv, "")
             .await?;
         let content_key_sig_armored =
             base64::engine::general_purpose::STANDARD.encode(&content_key_sig);
@@ -420,10 +415,11 @@ impl ProtonFileUploader {
             };
             let ciphertext_hash_hex = hex::encode(ciphertext_hash);
 
-            // Detached signature of plaintext block.
+            // Detached signature of plaintext block — no signature context
+            // (JS `encryptBlock` signs via detached encryptAndSign).
             let block_sig_bytes = self
                 .openpgp
-                .sign(plaintext_block, &address_priv, "drive.file.block")
+                .sign(plaintext_block, &address_priv, "")
                 .await?;
 
             // Encrypt the block signature to the address public key.
@@ -539,9 +535,13 @@ impl ProtonFileUploader {
             })
             .collect();
 
+        // No signature context: JS signManifest → signArmored signs with no
+        // context (js/sdk/src/crypto/driveCrypto.ts), and verifyManifest →
+        // verifyArmored reads it back with no context. A non-empty context here
+        // would embed a critical notation that OpenPGP.js verification rejects.
         let manifest_sig = self
             .openpgp
-            .sign(&manifest_payload, &address_priv, "drive.file.manifest")
+            .sign(&manifest_payload, &address_priv, "")
             .await?;
         let manifest_sig_armored = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
 

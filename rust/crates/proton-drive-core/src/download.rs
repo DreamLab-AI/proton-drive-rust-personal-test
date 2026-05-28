@@ -758,10 +758,9 @@ mod tests {
         let hash_bytes = base64::engine::general_purpose::STANDARD
             .decode(&ciphertext_hash)
             .unwrap();
-        let manifest_sig_bytes = crypto
-            .sign(&hash_bytes, &sign_key, "drive.file.manifest")
-            .await
-            .unwrap();
+        // No signature context — matches production manifest signing (JS
+        // signManifest → signArmored uses no context).
+        let manifest_sig_bytes = crypto.sign(&hash_bytes, &sign_key, "").await.unwrap();
         let manifest_sig_b64 =
             base64::engine::general_purpose::STANDARD.encode(&manifest_sig_bytes);
 

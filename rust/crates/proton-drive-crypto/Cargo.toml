@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hex.workspace = true
 pgp = "0.16"
 proton-srp = "0.8.2"
