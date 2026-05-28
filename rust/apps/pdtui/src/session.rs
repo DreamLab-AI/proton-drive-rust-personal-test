@@ -108,15 +108,45 @@ pub enum SessionError {
     Parse(#[from] serde_json::Error),
 }
 
+/// Per-process temp directory that session persistence is redirected to under
+/// `cfg(test)`, so unit tests never touch the developer's real session files.
+#[cfg(test)]
+static TEST_CONFIG_DIR: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+    let dir = std::env::temp_dir().join(format!("pdtui-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+});
+
 impl Session {
     pub fn config_path() -> PathBuf {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME").unwrap_or_default();
-                PathBuf::from(home).join(".config")
-            });
-        base.join("pdtui").join("session.json")
+        // In test builds, redirect all session persistence to a per-process
+        // temp directory. Unit tests exercise `do_refresh`/`from_login`, which
+        // write the session + secret files; without this redirect they would
+        // clobber the developer's real `~/.config/pdtui/` session.
+        #[cfg(test)]
+        {
+            return TEST_CONFIG_DIR.join("session.json");
+        }
+        #[cfg(not(test))]
+        {
+            let base = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let home = std::env::var_os("HOME").unwrap_or_default();
+                    PathBuf::from(home).join(".config")
+                });
+            base.join("pdtui").join("session.json")
+        }
+    }
+
+    /// Path to the 0600 secret-fallback file holding `refresh_token` +
+    /// `key_password`. Used when no OS secret store is available (e.g. headless
+    /// containers where the `keyring` crate degrades to an in-memory backend
+    /// that cannot persist across processes). Personal-use only (ADR-0007).
+    pub fn secret_path() -> PathBuf {
+        let mut p = Self::config_path();
+        p.set_file_name("session.secret.json");
+        p
     }
 
     pub fn load() -> Result<Self, SessionError> {
@@ -211,6 +241,58 @@ fn load_keyring(uid: &str) -> Result<KeyringPayload, SessionManagerError> {
         other => SessionManagerError::Keyring(other.to_string()),
     })?;
     serde_json::from_str(&raw).map_err(SessionManagerError::Json)
+}
+
+// ---------------------------------------------------------------------------
+// Secret-file fallback (0600) — for environments with no usable OS secret
+// store. The same `KeyringPayload` schema is reused so the two stores cannot
+// drift. ADR-0007: personal use only.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn save_secret_file(
+    uid: &str,
+    refresh_token: &str,
+    key_password: &str,
+) -> Result<(), SessionManagerError> {
+    let payload = KeyringPayload {
+        uid: uid.to_owned(),
+        refresh_token: refresh_token.to_owned(),
+        key_password: key_password.to_owned(),
+    };
+    let json = serde_json::to_string(&payload)?;
+    let path = Session::secret_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, json.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn load_secret_file(uid: &str) -> Result<KeyringPayload, SessionManagerError> {
+    let path = Session::secret_path();
+    if !path.exists() {
+        return Err(SessionManagerError::NoKeyring(uid.to_owned()));
+    }
+    let raw = std::fs::read(&path)?;
+    let payload: KeyringPayload = serde_json::from_slice(&raw)?;
+    if payload.uid != uid {
+        return Err(SessionManagerError::NoKeyring(uid.to_owned()));
+    }
+    Ok(payload)
+}
+
+pub(crate) fn delete_secret_file() -> Result<(), SessionManagerError> {
+    let path = Session::secret_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SessionManagerError::Io(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,8 +425,17 @@ pub(crate) async fn do_refresh(
     // return an ExpiresIn field in the refresh response.
     let expires_at = Instant::now() + Duration::from_secs(30 * 60);
 
-    // Persist before updating in-memory state.
-    save_keyring(
+    // Persist before updating in-memory state. Keyring is best-effort (it may
+    // be an in-memory backend on headless hosts); the 0600 secret file is the
+    // authoritative fallback and must stay in sync with the rotated token.
+    if let Err(e) = save_keyring(
+        &state.uid,
+        &new_token.refresh_token,
+        state.key_password.as_str(),
+    ) {
+        warn!("keyring update on refresh failed ({e}); updating secret-file fallback");
+    }
+    save_secret_file(
         &state.uid,
         &new_token.refresh_token,
         state.key_password.as_str(),
@@ -438,7 +529,14 @@ impl SessionManager {
         expires_in_secs: u64,
     ) -> Result<Self, SessionManagerError> {
         let expires_at = Instant::now() + Duration::from_secs(expires_in_secs);
-        save_keyring(&uid, refresh_token.as_str(), key_password.as_str())?;
+        // Best-effort keyring write. On headless hosts the `keyring` crate
+        // degrades to an in-memory backend that cannot persist across
+        // processes, so the 0600 secret file below is the authoritative
+        // fallback for `from_keyring` pickup (ADR-0007, personal use).
+        if let Err(e) = save_keyring(&uid, refresh_token.as_str(), key_password.as_str()) {
+            warn!("keyring write failed ({e}); relying on 0600 secret-file fallback");
+        }
+        save_secret_file(&uid, refresh_token.as_str(), key_password.as_str())?;
         write_session_file(&uid, access_token.as_str(), expires_at)?;
         let state = SessionState {
             uid,
@@ -456,7 +554,14 @@ impl SessionManager {
         http: Arc<dyn ProtonDriveHttpClient>,
     ) -> Result<Self, SessionManagerError> {
         let sf = load_session_file()?;
-        let kp = load_keyring(&sf.uid)?;
+        // Prefer the OS keyring; fall back to the 0600 secret file when the
+        // keyring has no entry (e.g. an in-memory backend on a headless host
+        // that did not survive the login process).
+        let kp = match load_keyring(&sf.uid) {
+            Ok(kp) => kp,
+            Err(SessionManagerError::NoKeyring(_)) => load_secret_file(&sf.uid)?,
+            Err(e) => return Err(e),
+        };
 
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -528,6 +633,7 @@ impl SessionManager {
             guard.uid.clone()
         };
         delete_keyring(&uid)?;
+        delete_secret_file()?;
         truncate_session_file()?;
         Ok(())
     }

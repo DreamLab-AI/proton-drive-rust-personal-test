@@ -63,7 +63,7 @@ pub struct Credentials {
     pub user_id: String,
     pub access_token: Zeroizing<String>,
     pub refresh_token: Zeroizing<String>,
-    /// Full bcrypt string ($2y$10…) — passphrase for unlocking the user's PGP key.
+    /// 31-char bcrypt hash portion — passphrase for unlocking the user's PGP key.
     pub key_password: Zeroizing<String>,
 }
 

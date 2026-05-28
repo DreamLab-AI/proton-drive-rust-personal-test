@@ -15,6 +15,7 @@ mod app;
 mod auth;
 mod http;
 mod keymap;
+mod mvp;
 mod panes;
 mod probe;
 mod session;
@@ -42,6 +43,7 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("login") => run_login().await,
+        Some("mvp") => run_mvp().await,
         Some("probe") => run_probe().await,
         Some("where") => {
             println!("{}", session::Session::config_path().display());
@@ -67,6 +69,7 @@ fn print_help() {
 USAGE:
     pdtui                 launch the TUI
     pdtui login           authenticate via SRP and persist session
+    pdtui mvp             live round-trip: list root, upload + download a file
     pdtui probe           run live-API diagnostic probes (M1 + M3 e2e)
     pdtui where           print where the session config file should live
     pdtui help            show this help
@@ -87,6 +90,16 @@ async fn run_login() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("login failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_mvp() -> ExitCode {
+    match mvp::run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("mvp failed: {e}");
             ExitCode::FAILURE
         }
     }

@@ -42,7 +42,7 @@ use proton_drive_api::upload::{
     BlockUploadEntry, BlockVerifier as ApiBlockVerifier, CommitRevisionRequest, CreateFileRequest,
     RequestBlockUploadRequest,
 };
-use proton_drive_crypto::{EncryptOptions, OpenPgpCrypto, PublicKey};
+use proton_drive_crypto::{ArmorKind, EncryptOptions, OpenPgpCrypto, PublicKey, armor};
 
 use crate::account::ProtonDriveAccount;
 use crate::error::{Error, Result};
@@ -53,6 +53,27 @@ use crate::nodes::{NodeUid, map_api_error};
 pub const BLOCK_SIZE: usize = 4 * 1024 * 1024;
 /// 16 MiB MVP limit (domain-model-mvp.md invariant table).
 pub const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Minimal envelope used to inspect a response's `Code`/`Error` without
+/// requiring the typed body — Proton error responses omit the typed payload.
+#[derive(serde::Deserialize)]
+struct EnvelopeProbe {
+    #[serde(rename = "Code")]
+    code: u32,
+    #[serde(rename = "Error", default)]
+    error: Option<String>,
+}
+
+/// Truncated, lossy view of a response body for error diagnostics.
+fn body_snippet(body: &[u8]) -> String {
+    const MAX: usize = 512;
+    let text = String::from_utf8_lossy(body);
+    if text.len() > MAX {
+        format!("{}…", &text[..MAX])
+    } else {
+        text.into_owned()
+    }
+}
 
 // ── public types ──────────────────────────────────────────────────────────────
 
@@ -197,11 +218,6 @@ impl ProtonFileUploader {
         let address_email = self.account.primary_email().to_owned();
         let address_priv = self.account.address_private_key(&address_email).await?;
 
-        // Derive the address public key from the private key. A secret-key
-        // armor is not a valid public-key armor, so we must re-export the
-        // public portion rather than reuse the private armored text.
-        let address_pub = self.openpgp.public_key(&address_priv).await?;
-
         // ── step 1: generate node crypto ─────────────────────────────────────
         let node_passphrase = self.openpgp.generate_passphrase();
 
@@ -211,7 +227,7 @@ impl ProtonFileUploader {
             .await?;
 
         let node_pub = PublicKey {
-            armored: node_pub_armored.clone(),
+            armored: node_pub_armored,
             fingerprint_hex: node_priv.fingerprint_hex.clone(),
         };
 
@@ -237,19 +253,19 @@ impl ProtonFileUploader {
                 EncryptOptions::default(),
             )
             .await?;
-        let node_passphrase_armored =
-            base64::engine::general_purpose::STANDARD.encode(&node_passphrase_encrypted);
+        // NodePassphrase is an armored PGP MESSAGE on the wire (OpenAPI
+        // `PGPMessage`); base64 is rejected with "not valid PGP data".
+        let node_passphrase_armored = armor(&node_passphrase_encrypted, ArmorKind::Message);
 
-        // Sign the node passphrase with address key (detached signature on
-        // the armored encrypted passphrase bytes — matches JS `generateNodeKeys`).
-        // No signature context: JS `encryptPassphrase` signs the passphrase
-        // detached with no context notation.
+        // Detached signature over the *plaintext* passphrase, signed by the
+        // address key, with no signature context — mirrors JS
+        // `encryptAndSignDetachedArmored` (the detached sig is over `binaryData`,
+        // i.e. the passphrase bytes, not the ciphertext). Armored PGP SIGNATURE.
         let passphrase_sig = self
             .openpgp
-            .sign(&node_passphrase_encrypted, &address_priv, "")
+            .sign(node_passphrase_bytes, &address_priv, "")
             .await?;
-        let passphrase_sig_armored =
-            base64::engine::general_purpose::STANDARD.encode(&passphrase_sig);
+        let passphrase_sig_armored = armor(&passphrase_sig, ArmorKind::Signature);
 
         // ── step 1b: generate content session key ─────────────────────────────
         let content_session_key = self
@@ -265,14 +281,15 @@ impl ProtonFileUploader {
         let content_key_packet_b64 =
             base64::engine::general_purpose::STANDARD.encode(&content_key_packet_bytes);
 
-        // Sign the content key packet with the address key.
-        // No signature context: JS `generateContentKeys` uses `signArmored`.
+        // Sign the *raw content session key bytes* with the **node** key (not
+        // the address key), no signature context — mirrors JS
+        // `generateContentKey`: `signArmored(contentKeyPacketSessionKey.data,
+        // [nodeKey])`. Armored PGP SIGNATURE.
         let content_key_sig = self
             .openpgp
-            .sign(&content_key_packet_bytes, &address_priv, "")
+            .sign(&content_session_key.data, &node_priv, "")
             .await?;
-        let content_key_sig_armored =
-            base64::engine::general_purpose::STANDARD.encode(&content_key_sig);
+        let content_key_sig_armored = armor(&content_key_sig, ArmorKind::Signature);
 
         // ── step 1c: encrypt file name + compute name hash ────────────────────
         let name_session_key = self
@@ -289,8 +306,8 @@ impl ProtonFileUploader {
                 EncryptOptions::default(),
             )
             .await?;
-        let encrypted_name_armored =
-            base64::engine::general_purpose::STANDARD.encode(&encrypted_name_bytes);
+        // Name is an armored PGP MESSAGE on the wire (OpenAPI `PGPMessage`).
+        let encrypted_name_armored = armor(&encrypted_name_bytes, ArmorKind::Message);
 
         // Name hash: HMAC-SHA256(parent_hash_key, name_bytes) → hex.
         // Mirrors JS `generateLookupHash` (driveCrypto.ts): the key is the
@@ -312,7 +329,10 @@ impl ProtonFileUploader {
             mime_type: self.metadata.media_type.clone(),
             client_uid: None,
             intended_upload_size: None,
-            node_key: node_pub_armored,
+            // NodeKey is the armored *private* key locked with `node_passphrase`
+            // (OpenAPI `PGPPrivateKey`) — readers unlock it with the decrypted
+            // passphrase. Sending the public key makes node-key unlock fail.
+            node_key: node_priv.armored.clone(),
             node_passphrase: node_passphrase_armored,
             node_passphrase_signature: passphrase_sig_armored,
             content_key_packet: content_key_packet_b64,
@@ -336,7 +356,9 @@ impl ProtonFileUploader {
         let mut block_sizes: Vec<u64> = Vec::new();
         let mut sha1_hasher = Sha1::new();
         let mut total_bytes: u64 = 0;
-        let mut block_index: u32 = 0;
+        // Proton block indices are 1-based (JS `streamUploader` does `index++`
+        // before the first use); Index 0 is rejected ("value should be positive").
+        let mut block_index: u32 = 1;
 
         loop {
             if cancel.is_cancelled() {
@@ -394,30 +416,27 @@ impl ProtonFileUploader {
             };
             let ciphertext_hash_hex = hex::encode(ciphertext_hash);
 
-            // Detached signature of plaintext block — no signature context
-            // (JS `encryptBlock` signs via detached encryptAndSign).
+            // Detached signature of the plaintext block, signed by the address
+            // key, no signature context (JS `encryptBlock`).
             let block_sig_bytes = self
                 .openpgp
                 .sign(plaintext_block, &address_priv, "")
                 .await?;
 
-            // Encrypt the block signature to the address public key.
-            let block_sig_session_key = self
-                .openpgp
-                .generate_session_key(&[], EncryptOptions::default())
-                .await?;
+            // Encrypt-only the detached signature to the **node** key under the
+            // **content session key** (JS `encryptSignature`: `encryptArmored(sig,
+            // [nodeKey], contentSessionKey)`), then armor. The server validates
+            // this as `PGPMessage`; readers decrypt it with the content key.
             let enc_sig_bytes = self
                 .openpgp
-                .encrypt_and_sign(
+                .encrypt(
                     &block_sig_bytes,
-                    &block_sig_session_key,
-                    std::slice::from_ref(&address_pub),
-                    &address_priv,
+                    &content_session_key,
+                    std::slice::from_ref(&node_pub),
                     EncryptOptions::default(),
                 )
                 .await?;
-            let enc_signature_armored =
-                base64::engine::general_purpose::STANDARD.encode(&enc_sig_bytes);
+            let enc_signature_armored = armor(&enc_sig_bytes, ArmorKind::Message);
 
             // Verifier token: XOR verification_code[i] with ciphertext[i].
             // (blockVerifier.ts: `verificationCode.map((v, i) => v ^ (encryptedData[i] || 0))`)
@@ -472,8 +491,11 @@ impl ProtonFileUploader {
             })
             .collect();
 
+        // Block-upload keys on the Proton AddressID, not the email (the email is
+        // only valid for `SignatureAddress` on the create-file request).
+        let address_id = self.account.address_id(&address_email).await?;
         let block_req = RequestBlockUploadRequest {
-            address_id: address_email.clone(),
+            address_id,
             volume_id: volume_id.clone(),
             link_id: link_id.clone(),
             revision_id: revision_id.clone(),
@@ -522,7 +544,7 @@ impl ProtonFileUploader {
             .openpgp
             .sign(&manifest_payload, &address_priv, "")
             .await?;
-        let manifest_sig_armored = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+        let manifest_sig_armored = armor(&manifest_sig, ArmorKind::Signature);
 
         // ── step 8: compute XAttr ─────────────────────────────────────────────
         let sha1_hex = hex::encode(sha1_hasher.finalize());
@@ -548,7 +570,7 @@ impl ProtonFileUploader {
                 EncryptOptions::default(),
             )
             .await?;
-        let xattr_armored = base64::engine::general_purpose::STANDARD.encode(&xattr_ciphertext);
+        let xattr_armored = armor(&xattr_ciphertext, ArmorKind::Message);
 
         // ── step 9: commit revision ───────────────────────────────────────────
         let commit_req = CommitRevisionRequest {
@@ -740,12 +762,27 @@ impl ProtonFileUploader {
             body: Some(body_bytes),
         };
         let resp = self.http.request_json(req).await?;
-        let env: ResponseEnvelope<proton_drive_api::upload::CreateFileResponse> =
-            serde_json::from_slice(&resp.body)
-                .map_err(|e| Error::Internal(format!("CreateFileResponse parse: {e}")))?;
-        if env.code != CODE_OK {
-            return Err(map_api_error(env.code, env.error));
+        // Error responses (e.g. 2500 name-exists, 2501 parent-not-found) omit
+        // the typed `File` body, so a `ResponseEnvelope<CreateFileResponse>`
+        // flatten-parse would fail with an opaque "missing field" before the
+        // code check. Probe the bare `Code`/`Error` first so API errors surface
+        // as domain errors.
+        let probe: EnvelopeProbe = serde_json::from_slice(&resp.body).map_err(|e| {
+            Error::Internal(format!(
+                "CreateFile envelope parse: {e}; body={}",
+                body_snippet(&resp.body)
+            ))
+        })?;
+        if probe.code != CODE_OK {
+            return Err(map_api_error(probe.code, probe.error));
         }
+        let env: ResponseEnvelope<proton_drive_api::upload::CreateFileResponse> =
+            serde_json::from_slice(&resp.body).map_err(|e| {
+                Error::Internal(format!(
+                    "CreateFileResponse parse: {e}; body={}",
+                    body_snippet(&resp.body)
+                ))
+            })?;
         Ok((env.inner.file.link_id, env.inner.file.revision_id))
     }
 
@@ -763,12 +800,25 @@ impl ProtonFileUploader {
             body: Some(body_bytes),
         };
         let resp = self.http.request_json(req).await?;
-        let env: ResponseEnvelope<proton_drive_api::upload::RequestBlockUploadResponse> =
-            serde_json::from_slice(&resp.body)
-                .map_err(|e| Error::Internal(format!("RequestBlockUploadResponse parse: {e}")))?;
-        if env.code != CODE_OK {
-            return Err(map_api_error(env.code, env.error));
+        // Probe Code/Error first: an error response omits the typed payload, so a
+        // direct typed parse would surface "missing field UploadLinks" and mask
+        // the real server error code.
+        let probe: EnvelopeProbe = serde_json::from_slice(&resp.body).map_err(|e| {
+            Error::Internal(format!(
+                "RequestBlockUpload envelope parse: {e}; body: {}",
+                body_snippet(&resp.body)
+            ))
+        })?;
+        if probe.code != CODE_OK {
+            return Err(map_api_error(probe.code, probe.error));
         }
+        let env: ResponseEnvelope<proton_drive_api::upload::RequestBlockUploadResponse> =
+            serde_json::from_slice(&resp.body).map_err(|e| {
+                Error::Internal(format!(
+                    "RequestBlockUploadResponse parse: {e}; body: {}",
+                    body_snippet(&resp.body)
+                ))
+            })?;
         Ok(env.inner.upload_links)
     }
 
@@ -800,8 +850,10 @@ impl ProtonFileUploader {
             method: HttpMethod::Post,
             path: bare_url.to_owned(),
             query: vec![],
+            // Storage endpoints authenticate with `pm-storage-token`, not the
+            // API bearer (apiService.ts `makeStorageRequest`).
             headers: vec![
-                ("Authorization".to_owned(), format!("Bearer {token}")),
+                ("pm-storage-token".to_owned(), token.to_owned()),
                 (
                     "content-type".to_owned(),
                     format!("multipart/form-data; boundary={boundary}"),
@@ -1087,6 +1139,18 @@ mod tests {
             })
         }
 
+        async fn encrypt(
+            &self,
+            data: &[u8],
+            _session_key: &SessionKey,
+            _encryption_keys: &[CPubKey],
+            _opts: EncryptOptions,
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            let mut out = b"FAKE_ENC:".to_vec();
+            out.extend_from_slice(data);
+            Ok(out)
+        }
+
         async fn encrypt_and_sign(
             &self,
             data: &[u8],
@@ -1219,6 +1283,10 @@ mod tests {
             })
         }
 
+        async fn address_id(&self, _email: &str) -> Result<String> {
+            Ok("fake-address-id".into())
+        }
+
         async fn key_password(&self) -> Result<String> {
             Ok("fake-key-password".into())
         }
@@ -1301,9 +1369,9 @@ mod tests {
             "Code": 1000,
             "UploadLinks": [
                 {
-                    "Index": 0,
-                    "BareURL": "https://upload.proton.me/block/0",
-                    "Token": "block-token-0"
+                    "Index": 1,
+                    "BareURL": "https://upload.proton.me/block/1",
+                    "Token": "block-token-1"
                 }
             ]
         });

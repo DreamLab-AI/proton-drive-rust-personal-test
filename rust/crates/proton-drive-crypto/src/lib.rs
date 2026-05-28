@@ -119,6 +119,68 @@ pub struct EncryptOptions {
     pub compress: bool,
 }
 
+// ── ASCII armor ─────────────────────────────────────────────────────────────
+
+/// ASCII-armor block type for [`armor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmorKind {
+    /// `-----BEGIN PGP MESSAGE-----` — encrypted messages (PKESK + SEIPD).
+    Message,
+    /// `-----BEGIN PGP SIGNATURE-----` — detached signatures.
+    Signature,
+}
+
+/// RFC 4880 ASCII-armor a binary OpenPGP packet stream.
+///
+/// Proton's wire format delivers `PGPMessage` / `PGPSignature` fields as armored
+/// text (per the Drive OpenAPI schema). The binary output of
+/// [`OpenPgpCrypto::sign`] / [`OpenPgpCrypto::encrypt_and_sign`] must be wrapped
+/// in an armor block before it is placed on the wire.
+pub fn armor(binary: &[u8], kind: ArmorKind) -> String {
+    use base64::Engine as _;
+
+    fn crc24(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0x00B7_04CE;
+        for &b in data {
+            crc ^= (b as u32) << 16;
+            for _ in 0..8 {
+                crc <<= 1;
+                if crc & 0x0100_0000 != 0 {
+                    crc ^= 0x0186_4CFB;
+                }
+            }
+        }
+        crc & 0x00FF_FFFF
+    }
+
+    let label = match kind {
+        ArmorKind::Message => "PGP MESSAGE",
+        ArmorKind::Signature => "PGP SIGNATURE",
+    };
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(binary);
+    let crc = crc24(binary);
+    let crc_bytes = [(crc >> 16) as u8, (crc >> 8) as u8, crc as u8];
+    let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc_bytes);
+
+    let mut out = String::with_capacity(b64.len() + 96);
+    out.push_str("-----BEGIN ");
+    out.push_str(label);
+    out.push_str("-----\n\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        // base64 output is ASCII, so every chunk is valid UTF-8.
+        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        out.push('\n');
+    }
+    out.push('=');
+    out.push_str(&crc_b64);
+    out.push('\n');
+    out.push_str("-----END ");
+    out.push_str(label);
+    out.push_str("-----\n");
+    out
+}
+
 // ── SRP types + trait ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -174,6 +236,18 @@ pub trait OpenPgpCrypto: Send + Sync {
         session_key: &SessionKey,
         encryption_keys: &[PublicKey],
         signing_key: &PrivateKey,
+        opts: EncryptOptions,
+    ) -> Result<Vec<u8>, CryptoError>;
+
+    /// Encrypt `data` with `session_key` (SEIPDv1) **without signing**, prepending
+    /// PKESK packets for each of `encryption_keys`. Mirrors JS `encryptArmored`
+    /// — used for the per-block encrypted-signature scheme (the detached block
+    /// signature is encrypted, not re-signed).
+    async fn encrypt(
+        &self,
+        data: &[u8],
+        session_key: &SessionKey,
+        encryption_keys: &[PublicKey],
         opts: EncryptOptions,
     ) -> Result<Vec<u8>, CryptoError>;
 
@@ -294,6 +368,78 @@ impl RpgpCrypto {
             SymmetricKeyAlgorithm::Camellia256 => 13,
             _ => 9,
         }
+    }
+
+    /// Decrypt a bare SEIPD payload (no preceding ESK) with a known session
+    /// key. rpgp's composed `Message` parser refuses a SEIPD that isn't
+    /// preceded by an ESK, so we walk the packet stream and decrypt the
+    /// protected-data packet directly. Returns the SEIPD's inner plaintext
+    /// (itself a sequence of OpenPGP packets — literal, or signed literal).
+    fn decrypt_bare_seipd(
+        binary: &[u8],
+        session_key: &[u8],
+        sym_alg: SymmetricKeyAlgorithm,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let parser = PacketParser::new(std::io::BufReader::new(binary));
+        for packet_result in parser {
+            let packet = packet_result.map_err(|e| CryptoError::Decrypt(e.to_string()))?;
+            if let pgp::packet::Packet::SymEncryptedProtectedData(seipd) = packet {
+                return seipd
+                    .decrypt(session_key, Some(sym_alg))
+                    .map_err(|e| CryptoError::Decrypt(e.to_string()));
+            }
+        }
+        Err(CryptoError::Decrypt(
+            "no SEIPD packet in bare payload".into(),
+        ))
+    }
+
+    /// Drain a decrypted message into plaintext and resolve its verification
+    /// verdict against the supplied keys. Shared by both the composed
+    /// (ESK + SEIPD) and bare-SEIPD decrypt paths.
+    fn finalize_decrypted(
+        mut decrypted: pgp::composed::Message<'_>,
+        verification_keys: &[PublicKey],
+    ) -> Result<(Vec<u8>, VerificationStatus), CryptoError> {
+        // Capture signature presence before draining; a bare literal payload
+        // (no signature) must map to NoSignature, not a spurious verdict.
+        let has_signature = matches!(
+            decrypted,
+            pgp::composed::Message::Signed { .. } | pgp::composed::Message::SignedOnePass { .. }
+        );
+
+        let plaintext = decrypted
+            .as_data_vec()
+            .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
+
+        if verification_keys.is_empty() {
+            return Ok((plaintext, VerificationStatus::NoSignature));
+        }
+
+        let pub_keys: Vec<SignedPublicKey> = verification_keys
+            .iter()
+            .filter_map(|k| Self::parse_public_key(k).ok())
+            .collect();
+
+        let key_refs: Vec<&dyn PublicKeyTrait> = pub_keys
+            .iter()
+            .map(|k| &k.primary_key as &dyn PublicKeyTrait)
+            .collect();
+
+        let status = match decrypted.verify_nested(&key_refs) {
+            Ok(results)
+                if results
+                    .iter()
+                    .any(|r| matches!(r, pgp::composed::VerificationResult::Valid(_))) =>
+            {
+                VerificationStatus::Ok
+            }
+            Ok(_) if has_signature => VerificationStatus::SignatureWrongSigner,
+            Ok(_) => VerificationStatus::NoSignature,
+            Err(_) => VerificationStatus::SignatureInvalid,
+        };
+
+        Ok((plaintext, status))
     }
 
     fn plain_to_session_key(sk: PlainSessionKey) -> Result<SessionKey, CryptoError> {
@@ -427,7 +573,11 @@ impl SrpModule for RpgpCrypto {
             .decode(salt)
             .map_err(|e| CryptoError::Key(format!("key-salt base64: {e}")))?;
         let hashed = proton_srp::mailbox_password_hash(password, &salt_bytes)?;
-        std::str::from_utf8(hashed.as_bytes())
+        // Proton's key password is the 31-char bcrypt hash portion only, NOT
+        // the full `$2y$10$[salt][hash]` string — the web client does
+        // `hash.slice(29)`, which strips the 29-char `$2y$10$`+salt prefix.
+        // Handing the full string to key-unlock makes every direct unlock fail.
+        std::str::from_utf8(hashed.hashed_password())
             .map(str::to_owned)
             .map_err(|e| CryptoError::Key(format!("bcrypt output not utf-8: {e}")))
     }
@@ -522,62 +672,72 @@ impl OpenPgpCrypto for RpgpCrypto {
         verification_keys: &[PublicKey],
     ) -> Result<(Vec<u8>, VerificationStatus), CryptoError> {
         let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm);
-        let plain_sk = PlainSessionKey::V3_4 {
-            sym_alg,
-            key: (*session_key.data).clone(),
-        };
-
         let binary = Self::to_binary_pgp(data)?;
-        let msg = pgp::composed::Message::from_bytes(std::io::BufReader::new(binary.as_ref()))
-            .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
 
-        let mut decrypted = msg
-            .decrypt_with_session_key(plain_sk)
-            .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
-
-        // Determine whether the message actually carries a signature before
-        // draining it into plaintext. A bare SEIPD payload (no signature) must
-        // map to NoSignature, not to a spurious verification verdict.
-        let has_signature = matches!(
-            decrypted,
-            pgp::composed::Message::Signed { .. } | pgp::composed::Message::SignedOnePass { .. }
-        );
-
-        let plaintext = decrypted
-            .as_data_vec()
-            .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
-
-        if verification_keys.is_empty() {
-            return Ok((plaintext, VerificationStatus::NoSignature));
-        }
-
-        let pub_keys: Vec<SignedPublicKey> = verification_keys
-            .iter()
-            .filter_map(|k| Self::parse_public_key(k).ok())
-            .collect();
-
-        // Pass primary keys as PublicKeyTrait references.
-        let key_refs: Vec<&dyn PublicKeyTrait> = pub_keys
-            .iter()
-            .map(|k| &k.primary_key as &dyn PublicKeyTrait)
-            .collect();
-
-        let status = match decrypted.verify_nested(&key_refs) {
-            Ok(results)
-                if results
-                    .iter()
-                    .any(|r| matches!(r, pgp::composed::VerificationResult::Valid(_))) =>
-            {
-                VerificationStatus::Ok
+        // Two payload shapes reach this function:
+        //   1. ESK (PKESK/SKESK) + SEIPD — the standard composed message. The
+        //      caller already extracted the session key, so we hand it to the
+        //      composed decryptor which skips the ESK packet.
+        //   2. Bare SEIPD with no preceding ESK — how Proton encrypts content
+        //      blocks (`encryptAndSignDetached(data, sessionKey, [], ...)`).
+        //      rpgp's composed parser rejects this (`unexpected packet type:
+        //      SymEncryptedProtectedData`), so we drop to the packet layer and
+        //      decrypt the SEIPD directly, then parse its plaintext as a message.
+        match pgp::composed::Message::from_bytes(std::io::BufReader::new(binary.as_ref())) {
+            Ok(msg) => {
+                let plain_sk = PlainSessionKey::V3_4 {
+                    sym_alg,
+                    key: (*session_key.data).clone(),
+                };
+                let decrypted = msg
+                    .decrypt_with_session_key(plain_sk)
+                    .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
+                Self::finalize_decrypted(decrypted, verification_keys)
             }
-            // A signature is present but none of the supplied keys validated it.
-            Ok(_) if has_signature => VerificationStatus::SignatureWrongSigner,
-            // No signature packet at all (bare SEIPD payload).
-            Ok(_) => VerificationStatus::NoSignature,
-            Err(_) => VerificationStatus::SignatureInvalid,
-        };
+            Err(_) => {
+                let inner = Self::decrypt_bare_seipd(&binary, &session_key.data, sym_alg)?;
+                let decrypted =
+                    pgp::composed::Message::from_bytes(std::io::BufReader::new(inner.as_slice()))
+                        .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
+                Self::finalize_decrypted(decrypted, verification_keys)
+            }
+        }
+    }
 
-        Ok((plaintext, status))
+    async fn encrypt(
+        &self,
+        data: &[u8],
+        session_key: &SessionKey,
+        encryption_keys: &[PublicKey],
+        opts: EncryptOptions,
+    ) -> Result<Vec<u8>, CryptoError> {
+        Self::reject_aead(&opts)?;
+
+        let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm);
+
+        // Unsigned literal message as the SEIPD plaintext.
+        let inner_bytes = MessageBuilder::from_bytes("", data.to_vec())
+            .to_vec(rand::thread_rng())
+            .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
+
+        let seipd = SymEncryptedProtectedData::encrypt_seipdv1(
+            rand::thread_rng(),
+            sym_alg,
+            &session_key.data,
+            &inner_bytes,
+        )
+        .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for pub_key in encryption_keys {
+            let key = Self::parse_public_key(pub_key)?;
+            Self::write_pkesk(session_key, sym_alg, &key, &mut out)?;
+        }
+        seipd
+            .to_writer_with_header(&mut out)
+            .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
+
+        Ok(out)
     }
 
     async fn encrypt_and_sign(
@@ -792,8 +952,13 @@ impl OpenPgpCrypto for RpgpCrypto {
             return Ok(VerificationStatus::NoSignature);
         }
 
-        let standalone = StandaloneSignature::from_bytes(std::io::BufReader::new(signature))
-            .map_err(|e| CryptoError::Verify(e.to_string()))?;
+        // Detached signatures arrive armored (`-----BEGIN PGP SIGNATURE-----`)
+        // or as raw binary packets; `StandaloneSignature::from_bytes` is
+        // binary-only, so dearmor first when needed.
+        let signature = Self::to_binary_pgp(signature)?;
+        let standalone =
+            StandaloneSignature::from_bytes(std::io::BufReader::new(signature.as_ref()))
+                .map_err(|e| CryptoError::Verify(e.to_string()))?;
 
         for pub_key in verification_keys {
             let key = Self::parse_public_key(pub_key)?;
@@ -918,37 +1083,7 @@ mod tests {
     /// RFC 4880 ASCII-armor a binary OpenPGP packet stream as a PGP MESSAGE
     /// block — exactly the shape Proton delivers NodePassphrase / NodeHashKey in.
     fn armor_pgp_message(binary: &[u8]) -> String {
-        use base64::Engine;
-
-        fn crc24(data: &[u8]) -> u32 {
-            let mut crc: u32 = 0x00B7_04CE;
-            for &b in data {
-                crc ^= (b as u32) << 16;
-                for _ in 0..8 {
-                    crc <<= 1;
-                    if crc & 0x0100_0000 != 0 {
-                        crc ^= 0x0186_4CFB;
-                    }
-                }
-            }
-            crc & 0x00FF_FFFF
-        }
-
-        let b64 = base64::engine::general_purpose::STANDARD.encode(binary);
-        let crc = crc24(binary);
-        let crc_bytes = [(crc >> 16) as u8, (crc >> 8) as u8, crc as u8];
-        let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc_bytes);
-
-        let mut out = String::from("-----BEGIN PGP MESSAGE-----\n\n");
-        for chunk in b64.as_bytes().chunks(64) {
-            out.push_str(std::str::from_utf8(chunk).unwrap());
-            out.push('\n');
-        }
-        out.push('=');
-        out.push_str(&crc_b64);
-        out.push('\n');
-        out.push_str("-----END PGP MESSAGE-----\n");
-        out
+        armor(binary, ArmorKind::Message)
     }
 
     /// Proton delivers PKESK and encrypted-message fields as ASCII-armored text

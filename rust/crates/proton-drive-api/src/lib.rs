@@ -114,7 +114,7 @@ pub mod shares {
         pub volume: MyFilesVolume,
         pub share: MyFilesShare,
         /// Root link wrapped as FolderDetailsDto — outer field is "Link".
-        pub link: MyFilesRootLink,
+        pub link: FolderDetails,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -137,11 +137,84 @@ pub mod shares {
         pub address_id: String,
     }
 
-    /// Outer "FolderDetailsDto" wrapper — `Link` field holds the actual LinkDto.
+    /// `FolderDetailsDto` from the v2 endpoints: the node's link metadata
+    /// (`Link`) and folder-specific fields (`Folder`) are split into sibling
+    /// objects — unlike the legacy flat [`super::nodes::Link`] that carries
+    /// `MIMEType`/`Size`/`FileProperties`/`FolderProperties` inline.
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "PascalCase")]
-    pub struct MyFilesRootLink {
-        pub link: super::nodes::Link,
+    pub struct FolderDetails {
+        pub link: LinkV2,
+        #[serde(default)]
+        pub folder: Option<FolderV2>,
+    }
+
+    /// v2 `LinkDto`. Notable differences from the legacy link: no `MIMEType`
+    /// or `Size` (those live in the sibling `File`/`Folder` objects), `NameHash`
+    /// instead of `Hash`, and `TrashTime` instead of `Trashed`.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct LinkV2 {
+        #[serde(rename = "LinkID")]
+        pub link_id: String,
+        #[serde(rename = "ParentLinkID")]
+        pub parent_link_id: Option<String>,
+        pub r#type: u8,
+        pub state: u8,
+        pub name: String,
+        #[serde(default)]
+        pub name_hash: Option<String>,
+        pub name_signature_email: Option<String>,
+        pub create_time: i64,
+        pub modify_time: i64,
+        #[serde(default)]
+        pub trash_time: Option<i64>,
+        pub node_key: String,
+        pub node_passphrase: String,
+        pub node_passphrase_signature: String,
+        pub signature_email: Option<String>,
+    }
+
+    /// v2 `FolderDto` — only the hash key is needed for upload-parent HMAC.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct FolderV2 {
+        #[serde(default)]
+        pub node_hash_key: Option<String>,
+    }
+
+    impl FolderDetails {
+        /// Project the split v2 shape onto the legacy [`super::nodes::Link`] so
+        /// downstream node conversion stays in one place. `mime_type`/`size`
+        /// are absent for a folder root (a folder has no media type and the
+        /// domain reports `None` size for folders).
+        #[must_use]
+        pub fn into_link(self) -> super::nodes::Link {
+            let folder_properties = self.folder.map(|f| super::nodes::FolderProperties {
+                node_hash_key: f.node_hash_key,
+            });
+            let l = self.link;
+            super::nodes::Link {
+                link_id: l.link_id,
+                parent_link_id: l.parent_link_id,
+                r#type: l.r#type,
+                name: l.name,
+                name_signature_email: l.name_signature_email,
+                hash: l.name_hash,
+                mime_type: None,
+                state: l.state,
+                size: 0,
+                created_time: l.create_time,
+                modify_time: l.modify_time,
+                trashed: l.trash_time,
+                node_key: l.node_key,
+                node_passphrase: l.node_passphrase,
+                node_passphrase_signature: l.node_passphrase_signature,
+                signature_email: l.signature_email,
+                file_properties: None,
+                folder_properties,
+            }
+        }
     }
 
     /// `GET drive/shares/{shareID}` returns the share fields **flat** at the
@@ -207,8 +280,10 @@ pub mod nodes {
         /// Name hash. Nullable on the wire (e.g. some folder layouts).
         #[serde(default)]
         pub hash: Option<String>,
-        #[serde(rename = "MIMEType")]
-        pub mime_type: String,
+        /// Nullable/absent on the wire for folders and root nodes (the JS SDK
+        /// treats it as `MIMEType || undefined`); only files carry a real type.
+        #[serde(rename = "MIMEType", default)]
+        pub mime_type: Option<String>,
         pub state: u8, // 1 = active, 2 = trashed, 3 = deleted
         pub size: u64,
         /// Proton's field is `CreateTime` (not `CreatedTime`); `CreationTime`
@@ -690,25 +765,43 @@ mod tests {
                 "Link": {
                     "LinkID": "root-link-001",
                     "Type": 1,
-                    "Name": "EncryptedRootName==",
-                    "Hash": "roothash",
-                    "MIMEType": "Folder",
+                    "ParentLinkID": null,
                     "State": 1,
-                    "Size": 0,
+                    "Name": "EncryptedRootName==",
+                    "NameHash": null,
+                    "NameSignatureEmail": null,
                     "CreateTime": 1700000000,
                     "ModifyTime": 1700000001,
+                    "TrashTime": null,
                     "NodeKey": "rootnodekey",
                     "NodePassphrase": "rootpassphrase",
-                    "NodePassphraseSignature": "rootpasssig"
-                }
+                    "NodePassphraseSignature": "rootpasssig",
+                    "SignatureEmail": null
+                },
+                "Folder": {
+                    "NodeHashKey": "-----BEGIN PGP MESSAGE-----\\nhashkey\\n-----END PGP MESSAGE-----"
+                },
+                "File": null,
+                "Sharing": null,
+                "Membership": null,
+                "Album": null
             }
         }"#;
         let resp: shares::GetMyFilesResponse = serde_json::from_str(body).expect("parse");
         assert_eq!(resp.volume.volume_id, "vol-abc123");
         assert_eq!(resp.share.share_id, "share-xyz789");
         assert_eq!(resp.share.address_id, "addr-001");
-        assert_eq!(resp.link.link.link_id, "root-link-001");
-        assert_eq!(resp.link.link.r#type, 1);
+        let link = resp.link.into_link();
+        assert_eq!(link.link_id, "root-link-001");
+        assert_eq!(link.r#type, 1);
+        assert!(link.parent_link_id.is_none());
+        assert!(link.mime_type.is_none());
+        assert!(
+            link.folder_properties
+                .and_then(|f| f.node_hash_key)
+                .is_some(),
+            "Folder.NodeHashKey must project onto folder_properties"
+        );
     }
 
     /// `GET drive/shares/{shareID}` returns share fields **flat** at the

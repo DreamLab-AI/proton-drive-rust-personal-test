@@ -150,11 +150,7 @@ pub fn link_to_maybe_node(
         parent,
         name,
         node_type,
-        media_type: if link.mime_type.is_empty() {
-            None
-        } else {
-            Some(link.mime_type)
-        },
+        media_type: link.mime_type.filter(|s| !s.is_empty()),
         size_bytes,
         created_at,
         modified_at,

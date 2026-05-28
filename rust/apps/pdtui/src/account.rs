@@ -46,6 +46,8 @@ pub struct PdtuiAccount {
     primary_email: String,
     /// Unlocked address private keys, keyed by lowercased email.
     address_keys: HashMap<String, PrivateKey>,
+    /// Address IDs (the Proton `AddressID`), keyed by lowercased email.
+    address_ids: HashMap<String, String>,
 }
 
 impl PdtuiAccount {
@@ -93,11 +95,18 @@ impl PdtuiAccount {
 
         debug!(%primary_email, unlocked = address_keys.len(), "account bootstrap complete");
 
+        let address_ids = addr_resp
+            .addresses
+            .iter()
+            .map(|a| (a.email.to_ascii_lowercase(), a.id.clone()))
+            .collect();
+
         Ok(Self {
             user_id,
             key_password,
             primary_email,
             address_keys,
+            address_ids,
         })
     }
 }
@@ -117,6 +126,13 @@ impl ProtonDriveAccount for PdtuiAccount {
             .get(&email.to_ascii_lowercase())
             .cloned()
             .ok_or_else(|| Error::Internal(format!("no unlocked address private key for {email}")))
+    }
+
+    async fn address_id(&self, email: &str) -> Result<String> {
+        self.address_ids
+            .get(&email.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| Error::Internal(format!("no address id for {email}")))
     }
 
     async fn key_password(&self) -> Result<String> {

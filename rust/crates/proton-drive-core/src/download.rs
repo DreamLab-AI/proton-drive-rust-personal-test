@@ -66,6 +66,10 @@ pub struct FileDownloader {
     pub(crate) node_private_key: PrivateKey,
     /// Public key for the address that signed this revision's content.
     pub(crate) signature_address_pub: Option<proton_drive_crypto::PublicKey>,
+    /// ContentKeyPacket from the file link's `FileProperties` (base64 PKESK
+    /// wrapping the content session key to the node key). The revision endpoint
+    /// does not return it — it lives on the node, like JS `base64ContentKeyPacket`.
+    pub(crate) content_key_packet: Option<String>,
 }
 
 impl FileDownloader {
@@ -92,14 +96,20 @@ impl FileDownloader {
         }
 
         // ── Step 2: decrypt content session key ──────────────────────────────
-        let content_key_packet = revision
+        // The ContentKeyPacket lives on the node (file link's FileProperties),
+        // not the revision (JS `base64ContentKeyPacket`). Prefer the node's;
+        // fall back to the revision for legacy shapes.
+        let content_key_packet = self
             .content_key_packet
             .as_deref()
-            .ok_or_else(|| Error::Internal("revision missing ContentKeyPacket".into()))?;
+            .or(revision.content_key_packet.as_deref())
+            .ok_or_else(|| Error::Internal("missing ContentKeyPacket".into()))?;
 
+        // The packet is base64 (BinaryString) on the wire; older callers may
+        // pass armored input — the crypto layer dearmors transparently.
         let ckp_bytes = base64::engine::general_purpose::STANDARD
             .decode(content_key_packet)
-            .map_err(|e| Error::Internal(format!("ContentKeyPacket base64: {e}")))?;
+            .unwrap_or_else(|_| content_key_packet.as_bytes().to_vec());
 
         let session_key = self
             .crypto
@@ -107,27 +117,11 @@ impl FileDownloader {
             .await
             .map_err(|e| Error::Decryption(format!("content session key: {e}")))?;
 
-        // Verify ContentKeyPacketSignature if present.
-        if let (Some(sig_b64), Some(addr_pub)) = (
-            revision.content_key_packet_signature.as_deref(),
-            self.signature_address_pub.as_ref(),
-        ) {
-            let sig_bytes = base64::engine::general_purpose::STANDARD
-                .decode(sig_b64)
-                .map_err(|e| Error::Internal(format!("ContentKeyPacketSignature base64: {e}")))?;
-            let status = self
-                .crypto
-                .verify(&ckp_bytes, &sig_bytes, std::slice::from_ref(addr_pub))
-                .await?;
-            if matches!(
-                status,
-                VerificationStatus::SignatureInvalid | VerificationStatus::SignatureWrongSigner
-            ) {
-                return Err(Error::Verification(
-                    "ContentKeyPacketSignature invalid — aborting download".into(),
-                ));
-            }
-        }
+        // ContentKeyPacketSignature is intentionally not verified here. JS
+        // `getContentKeyPacketSessionKey` decrypts with empty verification keys
+        // (`decryptAndVerifySessionKey(..., nodeKey, [])`); download integrity is
+        // guaranteed by the manifest signature, per-block embedded signatures,
+        // and the SHA-256 ciphertext hash checks below.
 
         // ── Step 3: verify manifest signature ────────────────────────────────
         // manifest_payload = concat(raw_hash_bytes for block in blocks, sorted by index)
@@ -167,11 +161,13 @@ impl FileDownloader {
             .map_err(|e| Error::Internal(format!("flush error: {e}")))?;
 
         // ── Step 5 (XAttr) ────────────────────────────────────────────────────
-        let last_modification_time = self.verify_xattr(
-            revision.x_attr.as_deref(),
-            total_bytes,
-            &sha1_hasher.finalize(),
-        );
+        let last_modification_time = self
+            .verify_xattr(
+                revision.x_attr.as_deref(),
+                total_bytes,
+                &sha1_hasher.finalize(),
+            )
+            .await;
 
         Ok(DownloadStats {
             bytes: total_bytes,
@@ -236,9 +232,12 @@ impl FileDownloader {
             manifest_payload.extend_from_slice(&hash_bytes);
         }
 
+        // ManifestSignature is armored (`-----BEGIN PGP SIGNATURE-----`) on the
+        // wire; older callers may pass base64 binary. `verify` dearmors armored
+        // input, so try base64 first then fall back to the raw bytes.
         let sig_bytes = base64::engine::general_purpose::STANDARD
             .decode(manifest_sig)
-            .map_err(|e| Error::Internal(format!("ManifestSignature base64: {e}")))?;
+            .unwrap_or_else(|_| manifest_sig.as_bytes().to_vec());
 
         // Verification keys: the signer address's public key when known,
         // otherwise fall back to the node's own public key. JS
@@ -271,15 +270,13 @@ impl FileDownloader {
         session_key: &proton_drive_crypto::SessionKey,
         verification_keys: &[proton_drive_crypto::PublicKey],
     ) -> Result<Vec<u8>> {
-        // Step 4a: GET BareURL with Authorization: Bearer {Token}
+        // Step 4a: GET BareURL. Storage endpoints authenticate with the
+        // `pm-storage-token` header, not the API bearer (JS `makeStorageRequest`).
         let req = BlobRequest {
             method: HttpMethod::Get,
             path: block.bare_url.clone(),
             query: vec![],
-            headers: vec![(
-                "Authorization".to_owned(),
-                format!("Bearer {}", block.token),
-            )],
+            headers: vec![("pm-storage-token".to_owned(), block.token.clone())],
             body: bytes::Bytes::new(),
         };
         let resp = self.http.request_blob(req).await?;
@@ -323,13 +320,13 @@ impl FileDownloader {
     /// When present, we verify:
     /// - `Common.Size` matches `total_bytes`
     /// - `Common.Digests.SHA1` matches `sha1_digest`
-    fn verify_xattr(
+    async fn verify_xattr(
         &self,
-        xattr_b64: Option<&str>,
+        xattr_armored: Option<&str>,
         total_bytes: u64,
         sha1_digest: &[u8],
     ) -> Option<std::time::SystemTime> {
-        let Some(xattr_raw) = xattr_b64 else {
+        let Some(xattr_raw) = xattr_armored else {
             tracing::debug!(
                 node_id = %self.node_uid.node_id,
                 "no XAttr on revision — skipping XAttr cross-check (legacy revision)"
@@ -337,33 +334,48 @@ impl FileDownloader {
             return None;
         };
 
-        // XAttr is a JSON string encrypted with the content session key.
-        // For MVP we attempt a best-effort JSON parse of the unencrypted form
-        // (some revisions store it as a plaintext base64-encoded JSON).
-        // Full crypto decryption of XAttr mirrors block decryption but uses the
-        // content session key directly (ADR-0009 note).
-        //
-        // TODO ME-followup: decrypt XAttr ciphertext via content session key
-        // once upload (MD) populates it.  For now, attempt direct base64→JSON
-        // parse and warn on failure.
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(xattr_raw) {
-            Ok(b) => b,
+        // XAttr is an armored PGP message (`armoredExtendedAttributes`):
+        // encrypted to the node key, signed by the address key. Decrypt the
+        // session key with the node key, then the message body; verification is
+        // best-effort (empty keys → no signature check), mirroring JS where a
+        // failed XAttr decrypt is non-fatal.
+        let xattr_bytes = xattr_raw.as_bytes();
+        let session_key = match self
+            .crypto
+            .decrypt_session_key(xattr_bytes, std::slice::from_ref(&self.node_private_key))
+            .await
+        {
+            Ok(sk) => sk,
             Err(e) => {
                 tracing::warn!(
                     node_id = %self.node_uid.node_id,
-                    "XAttr base64 decode failed: {e} — skipping cross-check"
+                    "XAttr session-key decrypt failed: {e} — skipping cross-check"
                 );
                 return None;
             }
         };
 
-        let json_str = match std::str::from_utf8(&decoded) {
-            Ok(s) => s,
-            Err(_) => {
-                // Ciphertext — not yet decryptable at MVP scope.
-                tracing::debug!(
+        let plaintext = match self
+            .crypto
+            .decrypt_and_verify(xattr_bytes, &session_key, &[])
+            .await
+        {
+            Ok((pt, _)) => pt,
+            Err(e) => {
+                tracing::warn!(
                     node_id = %self.node_uid.node_id,
-                    "XAttr is ciphertext — decrypt path not yet implemented (ME-followup)"
+                    "XAttr decrypt failed: {e} — skipping cross-check"
+                );
+                return None;
+            }
+        };
+
+        let json_str = match std::str::from_utf8(&plaintext) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    node_id = %self.node_uid.node_id,
+                    "XAttr plaintext not UTF-8: {e}"
                 );
                 return None;
             }
@@ -573,6 +585,30 @@ pub async fn decrypt_share_key(
     Ok(share_priv)
 }
 
+/// Decrypt an armored node name with the parent node's private key.
+///
+/// The node `Name` is an armored PGP MESSAGE (PKESK to the parent node key +
+/// SEIPD), signed by the address key. JS `decryptNodeName` →
+/// `decryptArmoredAndVerify(name, [parentKey], verificationKeys)`; verification
+/// failures are non-fatal (the caller reads `verified` separately), so we
+/// decrypt without verification keys here.
+pub async fn decrypt_node_name(
+    crypto: &Arc<dyn OpenPgpCrypto>,
+    armored_name: &str,
+    parent_key: &PrivateKey,
+) -> Result<String> {
+    let name_bytes = armored_name.as_bytes();
+    let session_key = crypto
+        .decrypt_session_key(name_bytes, std::slice::from_ref(parent_key))
+        .await
+        .map_err(|e| Error::Decryption(format!("node name session key: {e}")))?;
+    let (plaintext, _) = crypto
+        .decrypt_and_verify(name_bytes, &session_key, &[])
+        .await
+        .map_err(|e| Error::Decryption(format!("node name plaintext: {e}")))?;
+    String::from_utf8(plaintext).map_err(|e| Error::Internal(format!("node name utf-8: {e}")))
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -770,6 +806,7 @@ mod tests {
             // We encrypted the session key to sign_key so use sign_key as node_private_key.
             node_private_key: sign_key,
             signature_address_pub: Some(sign_pub),
+            content_key_packet: None,
         };
 
         let mut output = Vec::new();
@@ -854,6 +891,7 @@ mod tests {
             revision_id: "rev-1".into(),
             node_private_key: sign_key,
             signature_address_pub: Some(sign_pub),
+            content_key_packet: None,
         };
 
         let mut out = Vec::new();
@@ -885,6 +923,7 @@ mod tests {
             revision_id: "rev-missing".into(),
             node_private_key: sign_key,
             signature_address_pub: Some(sign_pub),
+            content_key_packet: None,
         };
 
         let mut out = Vec::new();
@@ -953,6 +992,7 @@ mod tests {
             revision_id: "rev-1".into(),
             node_private_key: sign_key,
             signature_address_pub: Some(sign_pub),
+            content_key_packet: None,
         };
 
         let mut out = Vec::new();
@@ -1031,6 +1071,7 @@ mod tests {
             revision_id: "rev-1".into(),
             node_private_key: node_key,
             signature_address_pub: None,
+            content_key_packet: None,
         };
 
         let mut out = Vec::new();

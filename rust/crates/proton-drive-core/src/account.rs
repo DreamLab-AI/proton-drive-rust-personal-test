@@ -21,6 +21,10 @@ pub trait ProtonDriveAccount: Send + Sync {
     /// to that address.
     async fn address_private_key(&self, email: &str) -> Result<PrivateKey>;
 
+    /// Resolve an address's stable ID (the Proton `AddressID`, not the email).
+    /// Block-upload and revision endpoints key on this ID.
+    async fn address_id(&self, email: &str) -> Result<String>;
+
     /// Fetch the user's salted key password (for SRP and key decryption).
     async fn key_password(&self) -> Result<String>;
 }
