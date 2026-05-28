@@ -182,13 +182,18 @@ pub(crate) fn save_keyring(
     refresh_token: &str,
     key_password: &str,
 ) -> Result<(), SessionManagerError> {
-    let payload = serde_json::json!({
-        "uid": uid,
-        "refresh_token": refresh_token,
-        "key_password": key_password,
-    });
+    // Serialize the same `KeyringPayload` struct that `load_keyring` parses, so
+    // the write and read schemas cannot drift (the prior bug: a second writer
+    // persisted `{uid, refresh_token}` with no `key_password`, which
+    // `load_keyring` then failed to resume).
+    let payload = KeyringPayload {
+        uid: uid.to_owned(),
+        refresh_token: refresh_token.to_owned(),
+        key_password: key_password.to_owned(),
+    };
+    let json = serde_json::to_string(&payload)?;
     keyring_entry(uid)?
-        .set_password(&payload.to_string())
+        .set_password(&json)
         .map_err(|e| SessionManagerError::Keyring(e.to_string()))
 }
 
@@ -802,5 +807,53 @@ mod tests {
                 .any(|(k, v)| k == "Authorization" && v == "Bearer abc")
         );
         assert!(h.iter().any(|(k, v)| k == "x-pm-uid" && v == "u1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence schema contract (regression for the login→pickup bug).
+    //
+    // The bug was a schema split: a CLI-login writer persisted a keyring entry
+    // with no `key_password` and a `session.json` with no `ExpiresAt`, which
+    // `from_keyring` could not resume. Both writers are now unified through
+    // `save_keyring` / `write_session_file`. These tests pin the exact JSON
+    // shapes that `load_keyring` / `load_session_file` must round-trip.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn keyring_payload_round_trips_with_key_password() {
+        let payload = KeyringPayload {
+            uid: "uid-123".to_owned(),
+            refresh_token: "refresh-abc".to_owned(),
+            key_password: "$2y$10$exampleexampleexample".to_owned(),
+        };
+        let json = serde_json::to_string(&payload).expect("serialize");
+        // The resume path (`load_keyring`) parses exactly this shape.
+        let back: KeyringPayload = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.uid, "uid-123");
+        assert_eq!(back.refresh_token, "refresh-abc");
+        assert_eq!(
+            back.key_password, "$2y$10$exampleexampleexample",
+            "key_password must survive the keyring round-trip — its absence was the login pickup bug"
+        );
+    }
+
+    #[test]
+    fn session_file_carries_expiry_for_resume() {
+        let sf = SessionFile {
+            uid: "uid-123".to_owned(),
+            access_token: "access-xyz".to_owned(),
+            expires_at_unix: 1_900_000_000,
+            app_version: default_app_version(),
+            base_url: default_base_url(),
+        };
+        let json = serde_json::to_string(&sf).expect("serialize");
+        assert!(
+            json.contains("\"ExpiresAt\""),
+            "session.json must include ExpiresAt so from_keyring can compute remaining lifetime: {json}"
+        );
+        let back: SessionFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.uid, "uid-123");
+        assert_eq!(back.access_token, "access-xyz");
+        assert_eq!(back.expires_at_unix, 1_900_000_000);
     }
 }

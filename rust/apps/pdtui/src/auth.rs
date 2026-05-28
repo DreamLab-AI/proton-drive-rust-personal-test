@@ -8,6 +8,7 @@
 //! manual-bearer path keeps working without any changes.
 
 use std::io::{self, Write as _};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use proton_drive::{
@@ -25,9 +26,7 @@ use subtle::ConstantTimeEq as _;
 use tracing::debug;
 use zeroize::Zeroizing;
 
-use crate::session::Session;
-
-const KEYRING_SERVICE: &str = "pdtui-proton-drive";
+use crate::session::{SessionManager, SessionManagerError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -45,8 +44,8 @@ pub enum AuthError {
     NoKeySalt,
     #[error("2FA is enabled — not yet supported; use scripts/configure-session.sh instead")]
     TwoFactorRequired,
-    #[error("keyring: {0}")]
-    Keyring(String),
+    #[error("session: {0}")]
+    Session(#[from] SessionManagerError),
     #[error("base64: {0}")]
     Base64(#[from] base64::DecodeError),
     #[error("io: {0}")]
@@ -161,61 +160,36 @@ pub async fn login(
     })
 }
 
-/// Store the refresh token (+ uid) in the OS keyring under the user's email.
-pub fn save_to_keyring(creds: &Credentials) -> Result<(), AuthError> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &creds.username)
-        .map_err(|e| AuthError::Keyring(e.to_string()))?;
-    let payload = serde_json::json!({
-        "uid": creds.uid,
-        "refresh_token": creds.refresh_token.as_str(),
-    });
-    entry
-        .set_password(&payload.to_string())
-        .map_err(|e| AuthError::Keyring(e.to_string()))
-}
-
-/// Write session.json (access_token + uid) for backward-compat with the
-/// manual-bearer path and the probe subcommand.
-pub fn write_session_file(creds: &Credentials) -> Result<(), AuthError> {
-    let session = Session {
-        access_token: (*creds.access_token).clone(),
-        uid: creds.uid.clone(),
-        app_version: format!("external-drive-pdtui@{}-stable", env!("CARGO_PKG_VERSION")),
-        base_url: "https://drive.proton.me/api".to_owned(),
-    };
-    let path = Session::config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(&session)?;
-    std::fs::write(&path, &json)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-/// Prompt for credentials interactively, run the full auth flow, and persist tokens.
+/// Prompt for credentials interactively, run the full auth flow, and persist
+/// the session through [`SessionManager::from_login`] — the single source of
+/// truth for the keyring (uid-keyed, with `key_password`) and `session.json`
+/// (with expiry). This is the same persistence path the TUI uses, so a session
+/// created here can later be resumed via [`SessionManager::from_keyring`].
 pub async fn login_interactive(base_url: &str, app_version: &str) -> Result<(), AuthError> {
     let username = prompt("Email: ")?;
     let password = rpassword::prompt_password("Password: ").map_err(AuthError::Io)?;
 
-    let http =
-        crate::http::ReqwestHttpClient::new(base_url, app_version).map_err(AuthError::Http)?;
+    let http: Arc<dyn ProtonDriveHttpClient> = Arc::new(
+        crate::http::ReqwestHttpClient::new(base_url, app_version).map_err(AuthError::Http)?,
+    );
 
     eprintln!("Authenticating…");
-    let creds = login(&http, &username, &password).await?;
+    let creds = login(&*http, &username, &password).await?;
+    let username = creds.username.clone();
 
-    match save_to_keyring(&creds) {
-        Ok(()) => eprintln!("✓ refresh token saved to OS keyring"),
-        Err(e) => eprintln!("warning: keyring unavailable ({e}) — session file only"),
-    }
+    // Proton returns no explicit expiry on login; 30 min matches the refresh path.
+    SessionManager::from_login(
+        Arc::clone(&http),
+        creds.uid,
+        creds.access_token,
+        creds.refresh_token,
+        creds.key_password,
+        30 * 60,
+    )
+    .await?;
 
-    write_session_file(&creds)?;
-    eprintln!("✓ session written to {}", Session::config_path().display());
-    eprintln!("✓ logged in as {}", creds.username);
+    eprintln!("✓ session persisted (keyring + session.json)");
+    eprintln!("✓ logged in as {username}");
     Ok(())
 }
 

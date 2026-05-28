@@ -272,14 +272,11 @@ impl App {
         match handle.await {
             Ok(Ok(creds)) => {
                 let username = creds.username.clone();
-                if let Err(e) = auth::save_to_keyring(&creds) {
-                    warn!("keyring unavailable: {e}");
-                }
-                if let Err(e) = auth::write_session_file(&creds) {
-                    warn!("session file write failed: {e}");
-                }
                 self.status = Some(format!("logged in as {username}"));
                 self.screen = Screen::Main;
+                // `build_client_from_login` persists the session through
+                // `SessionManager::from_login` (keyring + session.json), so no
+                // separate persistence step is needed here.
                 if let Err(e) = self.build_client_from_login(creds).await {
                     warn!("client build after login failed: {e}");
                     self.panes.remote.error = Some(format!("listing failed: {e}"));
