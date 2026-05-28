@@ -65,6 +65,45 @@ pub mod user {
 pub mod shares {
     use super::*;
 
+    /// Response from `GET drive/v2/shares/my-files`.
+    ///
+    /// Mirrors `PrimaryRootShareResponseDto` in driveTypes.ts.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct GetMyFilesResponse {
+        pub volume: MyFilesVolume,
+        pub share: MyFilesShare,
+        /// Root link wrapped as FolderDetailsDto — outer field is "Link".
+        pub link: MyFilesRootLink,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct MyFilesVolume {
+        #[serde(rename = "VolumeID")]
+        pub volume_id: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct MyFilesShare {
+        #[serde(rename = "ShareID")]
+        pub share_id: String,
+        pub creator_email: Option<String>,
+        pub key: String,
+        pub passphrase: String,
+        pub passphrase_signature: String,
+        #[serde(rename = "AddressID")]
+        pub address_id: String,
+    }
+
+    /// Outer "FolderDetailsDto" wrapper — `Link` field holds the actual LinkDto.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct MyFilesRootLink {
+        pub link: super::nodes::Link,
+    }
+
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct GetShareResponse {
@@ -102,6 +141,9 @@ pub mod nodes {
     #[serde(rename_all = "PascalCase")]
     pub struct GetChildrenResponse {
         pub links: Vec<Link>,
+        /// Non-zero means more pages exist; fetch with next `Page` index.
+        #[serde(default)]
+        pub more: u8,
     }
 
     /// A link is Proton's wire name for what the domain calls a Node.
@@ -436,11 +478,123 @@ mod tests {
                 "NodeKey": "armored", "NodePassphrase": "armored",
                 "NodePassphraseSignature": "armored",
                 "FolderProperties": { "NodeHashKey": "armored" }
-            }]
+            }],
+            "More": 0
         }"#;
         let resp: nodes::GetChildrenResponse = serde_json::from_str(body).expect("parse");
         assert_eq!(resp.links.len(), 1);
         assert_eq!(resp.links[0].r#type, 1);
         assert!(resp.links[0].folder_properties.is_some());
+        assert_eq!(resp.more, 0);
+    }
+
+    #[test]
+    fn deserialize_children_response_with_pagination() {
+        // Realistic JSON matching the v1 children endpoint shape.
+        // Includes a file node (Type=2) with FileProperties, an active revision,
+        // and More=1 indicating a second page exists.
+        let body = r#"{
+            "Code": 1000,
+            "Links": [
+                {
+                    "LinkID": "folder-link-1",
+                    "ParentLinkID": "root-link",
+                    "Type": 1,
+                    "Name": "yyMwuB1jJ2jGlHbzT3bxpgKQaVWpzlEn4R6B5X0cOiU=",
+                    "Hash": "abc123hash",
+                    "MIMEType": "Folder",
+                    "State": 1,
+                    "Size": 0,
+                    "CreatedTime": 1700000000,
+                    "ModifyTime": 1700000100,
+                    "NodeKey": "-----BEGIN PGP PUBLIC KEY BLOCK-----\\nabc\\n-----END PGP PUBLIC KEY BLOCK-----",
+                    "NodePassphrase": "-----BEGIN PGP MESSAGE-----\\ndef\\n-----END PGP MESSAGE-----",
+                    "NodePassphraseSignature": "-----BEGIN PGP SIGNATURE-----\\nghi\\n-----END PGP SIGNATURE-----",
+                    "FolderProperties": { "NodeHashKey": "-----BEGIN PGP MESSAGE-----\\njkl\\n-----END PGP MESSAGE-----" }
+                },
+                {
+                    "LinkID": "file-link-1",
+                    "ParentLinkID": "root-link",
+                    "Type": 2,
+                    "Name": "zzEncryptedFileName==",
+                    "Hash": "def456hash",
+                    "MIMEType": "text/plain",
+                    "State": 1,
+                    "Size": 1234,
+                    "CreatedTime": 1700001000,
+                    "ModifyTime": 1700001100,
+                    "NodeKey": "-----BEGIN PGP PUBLIC KEY BLOCK-----\\nxyz\\n-----END PGP PUBLIC KEY BLOCK-----",
+                    "NodePassphrase": "-----BEGIN PGP MESSAGE-----\\nuvw\\n-----END PGP MESSAGE-----",
+                    "NodePassphraseSignature": "-----BEGIN PGP SIGNATURE-----\\nrst\\n-----END PGP SIGNATURE-----",
+                    "FileProperties": {
+                        "ContentKeyPacket": "-----BEGIN PGP MESSAGE-----\\ncontent\\n-----END PGP MESSAGE-----",
+                        "ContentKeyPacketSignature": "-----BEGIN PGP SIGNATURE-----\\ncontentsig\\n-----END PGP SIGNATURE-----",
+                        "ActiveRevision": {
+                            "ID": "rev-1",
+                            "State": 1,
+                            "CreatedTime": 1700001050,
+                            "Size": 1234
+                        }
+                    }
+                }
+            ],
+            "More": 1
+        }"#;
+        let resp: nodes::GetChildrenResponse = serde_json::from_str(body).expect("parse");
+        assert_eq!(resp.links.len(), 2, "expected 2 links");
+        assert_eq!(resp.more, 1, "More flag should indicate another page");
+
+        let folder = &resp.links[0];
+        assert_eq!(folder.link_id, "folder-link-1");
+        assert_eq!(folder.r#type, 1);
+        assert!(folder.folder_properties.is_some());
+        assert!(folder.file_properties.is_none());
+
+        let file = &resp.links[1];
+        assert_eq!(file.link_id, "file-link-1");
+        assert_eq!(file.r#type, 2);
+        assert!(file.file_properties.is_some());
+        let fp = file.file_properties.as_ref().unwrap();
+        assert!(fp.active_revision.is_some());
+        assert_eq!(fp.active_revision.as_ref().unwrap().id, "rev-1");
+    }
+
+    #[test]
+    fn deserialize_my_files_response() {
+        // Mirrors PrimaryRootShareResponseDto shape.
+        let body = r#"{
+            "Code": 1000,
+            "Volume": { "VolumeID": "vol-abc123" },
+            "Share": {
+                "ShareID": "share-xyz789",
+                "CreatorEmail": "alice@proton.me",
+                "Key": "-----BEGIN PGP PRIVATE KEY BLOCK-----\\nsharekey\\n-----END PGP PRIVATE KEY BLOCK-----",
+                "Passphrase": "-----BEGIN PGP MESSAGE-----\\npassphrase\\n-----END PGP MESSAGE-----",
+                "PassphraseSignature": "-----BEGIN PGP SIGNATURE-----\\npasssig\\n-----END PGP SIGNATURE-----",
+                "AddressID": "addr-001"
+            },
+            "Link": {
+                "Link": {
+                    "LinkID": "root-link-001",
+                    "Type": 1,
+                    "Name": "EncryptedRootName==",
+                    "Hash": "roothash",
+                    "MIMEType": "Folder",
+                    "State": 1,
+                    "Size": 0,
+                    "CreatedTime": 1700000000,
+                    "ModifyTime": 1700000001,
+                    "NodeKey": "rootnodekey",
+                    "NodePassphrase": "rootpassphrase",
+                    "NodePassphraseSignature": "rootpasssig"
+                }
+            }
+        }"#;
+        let resp: shares::GetMyFilesResponse = serde_json::from_str(body).expect("parse");
+        assert_eq!(resp.volume.volume_id, "vol-abc123");
+        assert_eq!(resp.share.share_id, "share-xyz789");
+        assert_eq!(resp.share.address_id, "addr-001");
+        assert_eq!(resp.link.link.link_id, "root-link-001");
+        assert_eq!(resp.link.link.r#type, 1);
     }
 }

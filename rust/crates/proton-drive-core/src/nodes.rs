@@ -1,6 +1,8 @@
 //! Node aggregate. Mirrors `js/sdk/src/interface/nodes.ts`.
 
 use crate::account::Author;
+use crate::error::Error;
+use proton_drive_api::nodes::Link;
 use proton_drive_crypto::{PrivateKey, SessionKey};
 use std::time::SystemTime;
 
@@ -77,6 +79,101 @@ impl MaybeNode {
             MaybeNode::Degraded { uid, .. } => uid,
             MaybeNode::Missing { uid } => uid,
         }
+    }
+}
+
+/// Convert a wire `Link` DTO into a domain `Node`.
+///
+/// Name decryption requires the node's passphrase to be decrypted by the
+/// parent (or share) key, then the encrypted name decrypted with that node key.
+/// For MVP, full crypto chain decryption is deferred: if a `decrypted_name`
+/// is not supplied by the caller, the name is a placeholder. Callers that
+/// can supply a decrypted name (e.g. root link from `my_files_root`) pass
+/// it directly.
+///
+/// # TODO MC-followup: full name decryption requires AddressProvider integration
+/// Once the `AddressProvider` trait surface is extended to expose per-address
+/// PGP keys, callers should decrypt `link.node_passphrase` with the share/parent
+/// key and then call `OpenPgpCrypto::decrypt_and_verify` on `link.name`.
+pub fn link_to_maybe_node(
+    link: Link,
+    volume_id: &str,
+    decrypted_name: Option<String>,
+) -> MaybeNode {
+    let uid = make_node_uid(volume_id, &link.link_id);
+    let parent = link
+        .parent_link_id
+        .as_deref()
+        .map(|pid| make_node_uid(volume_id, pid));
+
+    let name = decrypted_name.unwrap_or_else(|| {
+        tracing::warn!(
+            link_id = %link.link_id,
+            "name decryption deferred — AddressProvider integration pending (TODO MC-followup)"
+        );
+        format!("<encrypted-{}>", link.link_id)
+    });
+
+    let node_type = match link.r#type {
+        1 => NodeType::Folder,
+        2 => NodeType::File,
+        _ => NodeType::Album,
+    };
+
+    let created_at =
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(link.created_time.max(0) as u64);
+    let modified_at =
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(link.modify_time.max(0) as u64);
+
+    let active_revision = link.file_properties.as_ref().and_then(|fp| {
+        fp.active_revision.as_ref().map(|rev| {
+            let rev_created = SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(rev.created_time.max(0) as u64);
+            Revision {
+                uid: rev.id.clone(),
+                state: RevisionState::Active,
+                size_bytes: Some(rev.size),
+                created_at: rev_created,
+                author: Author::Anonymous,
+            }
+        })
+    });
+
+    let size_bytes = if link.size == 0 && node_type == NodeType::Folder {
+        None
+    } else {
+        Some(link.size)
+    };
+
+    MaybeNode::Node(Box::new(Node {
+        uid,
+        parent,
+        name,
+        node_type,
+        media_type: if link.mime_type.is_empty() {
+            None
+        } else {
+            Some(link.mime_type)
+        },
+        size_bytes,
+        created_at,
+        modified_at,
+        trashed: link.trashed.is_some(),
+        author: Author::Anonymous,
+        active_revision,
+    }))
+}
+
+/// Parse a protocol error into the appropriate domain `Error`.
+///
+/// The Proton API returns `Code` ≠ 1000 for known error conditions.
+/// We surface the message directly; callers decide whether to retry.
+pub fn map_api_error(code: u32, message: Option<String>) -> Error {
+    let msg = message.unwrap_or_else(|| format!("API error {code}"));
+    match code {
+        2501 => Error::NotFound(msg),
+        2011 => Error::NodeWithSameNameExists { name: msg },
+        _ => Error::Internal(msg),
     }
 }
 

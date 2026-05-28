@@ -15,11 +15,14 @@ workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+proton-drive-api.workspace = true
 proton-drive-cache.workspace = true
 proton-drive-crypto.workspace = true
 proton-drive-telemetry.workspace = true
