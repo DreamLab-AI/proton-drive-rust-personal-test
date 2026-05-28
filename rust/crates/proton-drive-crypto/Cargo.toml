@@ -20,6 +20,9 @@ proton-srp = "0.8.2"
 rand.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+sha2.workspace = true
+serde_json.workspace = true

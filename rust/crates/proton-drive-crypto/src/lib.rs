@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use pgp::{
     composed::{
@@ -70,7 +71,8 @@ pub struct PrivateKey {
     pub armored: String,
     pub fingerprint_hex: String,
     /// Passphrase used to lock/unlock this key. Empty for unencrypted keys.
-    pub passphrase: String,
+    /// Wrapped in `Zeroizing` so the secret is wiped on drop (ADR-0011).
+    pub passphrase: Zeroizing<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +93,8 @@ pub enum AeadAlgorithm {
 /// (9 = AES-256, 7 = AES-128).
 #[derive(Debug, Clone)]
 pub struct SessionKey {
-    pub data: Vec<u8>,
+    /// Raw key bytes. Wrapped in `Zeroizing` so the secret is wiped on drop (ADR-0011).
+    pub data: Zeroizing<Vec<u8>>,
     pub cipher_algorithm: u8,
     pub aead: AeadAlgorithm,
 }
@@ -285,14 +288,14 @@ impl RpgpCrypto {
 
     fn plain_to_session_key(sk: PlainSessionKey) -> Result<SessionKey, CryptoError> {
         // PlainSessionKey implements Drop (zeroize), so match by ref + clone.
-        let (data, cipher_algorithm) = match &sk {
+        let (raw_data, cipher_algorithm) = match &sk {
             PlainSessionKey::V3_4 { key, sym_alg } => (key.clone(), Self::sym_alg_id(*sym_alg)),
             PlainSessionKey::V6 { key } => (key.clone(), 9u8),
             PlainSessionKey::Unknown { key, sym_alg } => (key.clone(), Self::sym_alg_id(*sym_alg)),
             PlainSessionKey::V5 { key } => (key.clone(), 9u8),
         };
         Ok(SessionKey {
-            data,
+            data: Zeroizing::new(raw_data),
             cipher_algorithm,
             aead: AeadAlgorithm::None,
         })
@@ -430,7 +433,7 @@ impl OpenPgpCrypto for RpgpCrypto {
         Ok(PrivateKey {
             armored: armored.to_owned(),
             fingerprint_hex,
-            passphrase: passphrase.to_owned(),
+            passphrase: Zeroizing::new(passphrase.to_owned()),
         })
     }
 
@@ -480,7 +483,7 @@ impl OpenPgpCrypto for RpgpCrypto {
         let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm);
         let plain_sk = PlainSessionKey::V3_4 {
             sym_alg,
-            key: session_key.data.clone(),
+            key: (*session_key.data).clone(),
         };
 
         let msg = pgp::composed::Message::from_bytes(std::io::BufReader::new(data))
@@ -595,7 +598,7 @@ impl OpenPgpCrypto for RpgpCrypto {
     ) -> Result<SessionKey, CryptoError> {
         Self::reject_aead(&opts)?;
         use rand::RngCore as _;
-        let mut data = vec![0u8; 32];
+        let mut data = Zeroizing::new(vec![0u8; 32]);
         rand::thread_rng().fill_bytes(&mut data);
         Ok(SessionKey {
             data,
@@ -655,7 +658,7 @@ impl OpenPgpCrypto for RpgpCrypto {
             PrivateKey {
                 armored: armored_private,
                 fingerprint_hex,
-                passphrase: passphrase.to_owned(),
+                passphrase: Zeroizing::new(passphrase.to_owned()),
             },
             armored_public,
         ))

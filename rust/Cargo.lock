@@ -1835,11 +1835,13 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -2126,9 +2128,12 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "proton-drive-api",
  "proton-drive-cache",
  "proton-drive-crypto",
  "proton-drive-telemetry",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2149,6 +2154,7 @@ dependencies = [
  "sha1",
  "thiserror 2.0.18",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

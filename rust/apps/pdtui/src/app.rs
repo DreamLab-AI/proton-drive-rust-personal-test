@@ -9,6 +9,8 @@ use ratatui::backend::CrosstermBackend;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use zeroize::Zeroizing;
+
 use crate::auth::{self, AuthError, Credentials};
 use crate::keymap::{Action, dispatch};
 use crate::panes::{Focus, Panes};
@@ -28,7 +30,9 @@ pub enum Screen {
 
 pub struct LoginForm {
     pub email: String,
-    pub password: String,
+    /// Password field. Wrapped in `Zeroizing` so the heap buffer is wiped on
+    /// drop (ADR-0011). Callers use `form.password.as_str()` to read it.
+    pub password: Zeroizing<String>,
     pub field: LoginField,
     pub error: Option<String>,
 }
@@ -43,7 +47,7 @@ impl LoginForm {
     pub fn new() -> Self {
         Self {
             email: String::new(),
-            password: String::new(),
+            password: Zeroizing::new(String::new()),
             field: LoginField::Email,
             error: None,
         }
@@ -197,7 +201,7 @@ impl App {
         let handle: JoinHandle<Result<Credentials, AuthError>> = tokio::spawn(async move {
             let http = crate::http::ReqwestHttpClient::new(BASE_URL, &app_version)
                 .map_err(AuthError::Http)?;
-            auth::login(&http, &email, &password).await
+            auth::login(&http, &email, password.as_str()).await
         });
         self.screen = Screen::Authenticating(handle);
     }

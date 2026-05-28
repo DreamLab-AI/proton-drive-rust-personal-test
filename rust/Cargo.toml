@@ -26,6 +26,8 @@ todo = "warn"
 
 [workspace.dependencies]
 async-trait = "0.1"
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["zeroize_derive", "derive"] }
 base64 = "0.22"
 bytes = "1"
 dashmap = "6"

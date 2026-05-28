@@ -31,6 +31,8 @@ reqwest.workspace = true
 rpassword = "7"
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
 tokio = { workspace = true, features = ["signal", "rt-multi-thread", "macros", "sync", "io-util", "fs"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

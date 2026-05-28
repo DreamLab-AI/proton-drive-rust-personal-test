@@ -21,7 +21,9 @@ use proton_drive_api::{
 use proton_drive_crypto::CryptoError;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use subtle::ConstantTimeEq as _;
 use tracing::debug;
+use zeroize::Zeroizing;
 
 use crate::session::Session;
 
@@ -52,15 +54,18 @@ pub enum AuthError {
 }
 
 /// Validated credentials after a successful SRP exchange.
+///
+/// `access_token`, `refresh_token`, and `key_password` are wrapped in
+/// `Zeroizing` so their heap storage is wiped on drop (ADR-0011).
 #[allow(dead_code)] // user_id + key_password consumed in M7 TUI wiring
 pub struct Credentials {
     pub username: String,
     pub uid: String,
     pub user_id: String,
-    pub access_token: String,
-    pub refresh_token: String,
+    pub access_token: Zeroizing<String>,
+    pub refresh_token: Zeroizing<String>,
     /// Full bcrypt string ($2y$10…) — passphrase for unlocking the user's PGP key.
-    pub key_password: String,
+    pub key_password: Zeroizing<String>,
 }
 
 /// Perform the full SRP login flow and return validated credentials.
@@ -106,7 +111,13 @@ pub async fn login(
     )
     .await?;
 
-    if auth_resp.server_proof != exchange.expected_server_proof {
+    // Constant-time comparison to avoid timing side-channel (ADR-0011).
+    let proofs_match: bool = auth_resp
+        .server_proof
+        .as_bytes()
+        .ct_eq(exchange.expected_server_proof.as_bytes())
+        .into();
+    if !proofs_match {
         return Err(AuthError::ServerProofMismatch);
     }
 
@@ -144,9 +155,9 @@ pub async fn login(
         username: username.to_owned(),
         uid: auth_resp.uid,
         user_id: auth_resp.user_id,
-        access_token: auth_resp.access_token,
-        refresh_token: auth_resp.refresh_token,
-        key_password,
+        access_token: Zeroizing::new(auth_resp.access_token),
+        refresh_token: Zeroizing::new(auth_resp.refresh_token),
+        key_password: Zeroizing::new(key_password),
     })
 }
 
@@ -156,7 +167,7 @@ pub fn save_to_keyring(creds: &Credentials) -> Result<(), AuthError> {
         .map_err(|e| AuthError::Keyring(e.to_string()))?;
     let payload = serde_json::json!({
         "uid": creds.uid,
-        "refresh_token": creds.refresh_token,
+        "refresh_token": creds.refresh_token.as_str(),
     });
     entry
         .set_password(&payload.to_string())
@@ -167,7 +178,7 @@ pub fn save_to_keyring(creds: &Credentials) -> Result<(), AuthError> {
 /// manual-bearer path and the probe subcommand.
 pub fn write_session_file(creds: &Credentials) -> Result<(), AuthError> {
     let session = Session {
-        access_token: creds.access_token.clone(),
+        access_token: (*creds.access_token).clone(),
         uid: creds.uid.clone(),
         app_version: format!("external-drive-pdtui@{}-stable", env!("CARGO_PKG_VERSION")),
         base_url: "https://drive.proton.me/api".to_owned(),
