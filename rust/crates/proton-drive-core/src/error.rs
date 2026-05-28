@@ -33,6 +33,12 @@ pub enum Error {
     #[error("node not found: {0}")]
     NotFound(String),
 
+    #[error("integrity check failed: {0}")]
+    IntegrityCheckFailed(String),
+
+    #[error("protocol violation: {0}")]
+    ProtocolViolation(String),
+
     #[error("not implemented in this build: {0}")]
     NotImplemented(&'static str),
 
