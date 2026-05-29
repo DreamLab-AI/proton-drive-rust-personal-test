@@ -35,3 +35,19 @@ config.json
 # Tests
 tests/storage
 tests/test-results
+
+# Rust
+rust/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Agent metadata (not part of source tree)
+.agentic-qe/
+.claude-flow/
+.swarm/
+**/.claude-flow/
+
+# Local-only secrets for the Rust port (see scripts/README.md)
+rust/.env
+rust/fixtures/auth/*
+!rust/fixtures/auth/.gitkeep

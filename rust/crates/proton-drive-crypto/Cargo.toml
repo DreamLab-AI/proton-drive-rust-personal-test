@@ -1,0 +1,29 @@
+[package]
+name = "proton-drive-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Proton Drive SDK — OpenPgpCrypto trait + rpgp impl (ADR-0002)"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hex.workspace = true
+pgp = "0.16"
+proton-srp = "0.8.2"
+rand.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+sha2.workspace = true
+serde_json.workspace = true

@@ -1,5 +1,16 @@
 # Proton Drive SDK
 
+> **DreamLab-AI fork note:** this fork adds an in-progress Rust port + `pdtui`
+> two-pane terminal browser under [`rust/`](./rust/), for personal use against
+> the fork owner's own Proton Drive account. Start at
+> [`HANDOFF.md`](./HANDOFF.md) →
+> [`docs/IMPLEMENTATION-STATUS.md`](./docs/IMPLEMENTATION-STATUS.md) →
+> [`docs/PRD-rust-port-and-tui.md`](./docs/PRD-rust-port-and-tui.md).
+> The upstream sections below remain authoritative for the JS/C#/Kotlin/Swift
+> SDKs.
+
+---
+
 The Proton Drive SDK provides a high-level interface for interacting with Proton Drive. It is available in the following languages:
 
 - **TypeScript** — native SDK in [`js/sdk/`](./js/sdk/), available on npm as [`@protontech/drive-sdk`](https://www.npmjs.com/package/@protontech/drive-sdk). See [changelog](./js/CHANGELOG.md) for changes.
