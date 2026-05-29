@@ -13,7 +13,10 @@ use crate::download::{
     resolve_volume_id,
 };
 use crate::error::{Error, Result};
-use crate::events::{DriveListener, EventSubscription, LatestEventIdProvider};
+use crate::events::{
+    DriveListener, EventSubscription, InMemoryLatestEventId, LatestEventIdProvider,
+    spawn_volume_event_loop,
+};
 use crate::http::{HttpMethod, JsonRequest, ProtonDriveHttpClient};
 use crate::nodes::{
     CachedCryptoMaterial, FolderChildrenFilter, MaybeNode, NodeUid, link_to_maybe_node,
@@ -438,11 +441,45 @@ impl ProtonDriveClient {
 
     // ----- Events -----------------------------------------------------------
 
+    /// Subscribe to the host's My Files volume events.
+    ///
+    /// Spawns an event-based polling loop (ADR-0001: sync is event-based, never
+    /// recursive tree traversal). The loop drains
+    /// `GET drive/v2/volumes/{volumeID}/events/{eventID}`, maps each raw event
+    /// onto a [`DriveEvent`], dispatches to `listener`, and persists the resume
+    /// cursor through the host's [`LatestEventIdProvider`] (or an in-memory
+    /// default when none is wired).
+    ///
+    /// The volume is resolved the same way the listing/download paths resolve
+    /// it: My Files share → `GET drive/shares/{shareID}` → real `VolumeID`.
+    ///
+    /// Dropping (or cancelling) the returned [`EventSubscription`] stops the
+    /// loop at the next await point.
     pub async fn subscribe_drive_events(
         &self,
-        _listener: Box<dyn DriveListener>,
+        listener: Box<dyn DriveListener>,
     ) -> Result<EventSubscription> {
-        Err(Error::NotImplemented("subscribe_drive_events — pending M6"))
+        // Resolve the My Files share, then translate it to the true volume id
+        // (NodeUid.volume_id from listing holds a *share id* — see FIXME on
+        // `file_uploader`/`file_downloader`).
+        let my_files: proton_drive_api::shares::GetMyFilesResponse =
+            self.api_get("/drive/v2/shares/my-files").await?;
+        let share_id = my_files.share.share_id;
+        let volume_id = resolve_volume_id(&self.opts.http_client, &share_id).await?;
+
+        // Host-supplied resume cursor, or an in-memory default that starts from
+        // the server's latest event id on each fresh subscription.
+        let provider: Arc<dyn LatestEventIdProvider> = match &self.opts.latest_event_id {
+            Some(p) => Arc::clone(p),
+            None => Arc::new(InMemoryLatestEventId::new()),
+        };
+
+        Ok(spawn_volume_event_loop(
+            Arc::clone(&self.opts.http_client),
+            volume_id,
+            listener,
+            provider,
+        ))
     }
 }
 

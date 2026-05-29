@@ -14,3 +14,13 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+prost.workspace = true
+# Generated proto types reference the well-known types (Timestamp, Any), which
+# prost maps to the prost-types crate at the crate root.
+prost-types.workspace = true
+
+[build-dependencies]
+prost.workspace = true
+prost-build.workspace = true
+prost-types.workspace = true
+protoc-bin-vendored.workspace = true

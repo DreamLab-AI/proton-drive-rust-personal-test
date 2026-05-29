@@ -30,7 +30,10 @@ pub use client::{ProtonDriveClient, ProtonDriveClientOptions};
 pub use config::ProtonDriveConfig;
 pub use download::{DownloadStats, FileDownloader};
 pub use error::{Error, Result};
-pub use events::{DriveEvent, DriveListener, EventSubscription};
+pub use events::{
+    DriveEvent, DriveListener, EventSubscription, FastForwardEvent, InMemoryLatestEventId,
+    LatestEventIdProvider, NodeEvent, NodeEventKind, TreeRefreshEvent, TreeRemovalEvent,
+};
 pub use http::ProtonDriveHttpClient;
 pub use nodes::{
     CachedCryptoMaterial, FolderChildrenFilter, MaybeNode, Node, NodeType, NodeUid, Revision,

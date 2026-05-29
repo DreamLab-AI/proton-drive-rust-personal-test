@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -34,6 +34,14 @@ dashmap = "6"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
+prost = "0.14"
+# Build-time protobuf codegen. The cross-language wire `.proto` files use
+# protobuf editions ("edition = 2023"), which requires a modern protoc (>= 27).
+# `protoc-bin-vendored` ships a bundled protoc (libprotoc 31.x) so the build is
+# hermetic and needs no system `protoc`; `prost-build` drives it.
+prost-build = "0.14"
+prost-types = "0.14"
+protoc-bin-vendored = "3.2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip"] }
 serde = { version = "1", features = ["derive"] }

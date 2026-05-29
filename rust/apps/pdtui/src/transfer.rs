@@ -363,14 +363,15 @@ fn media_type_from_path(path: &std::path::Path) -> String {
 mod tests {
     use super::*;
 
-    fn make_transfer(
-        direction: TransferDirection,
-        state: TransferState,
-    ) -> (
+    /// A `Transfer` plus the sender halves of its progress/outcome channels,
+    /// kept alive by tests so the receivers inside the `Transfer` stay open.
+    type TransferHarness = (
         Transfer,
         watch::Sender<u64>,
         watch::Sender<Option<Result<(), String>>>,
-    ) {
+    );
+
+    fn make_transfer(direction: TransferDirection, state: TransferState) -> TransferHarness {
         let (progress_tx, progress_rx) = watch::channel::<u64>(0);
         let (outcome_tx, outcome_rx) = watch::channel::<Option<Result<(), String>>>(None);
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());

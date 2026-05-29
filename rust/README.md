@@ -46,17 +46,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build -p pdtui
 ```
 
-## Current state (M0)
+## Current state (v0.1.0 — unaudited MVP)
 
 - ✅ Workspace scaffolded, all crates compile
 - ✅ Trait surface mirrors JS `interface/` 1:1
 - ✅ Error taxonomy, config, value objects in place
 - ✅ pdtui skeleton with keymap dispatch and ratatui rendering
-- ⏳ M1: protobuf + OpenAPI codegen in `proton-drive-api`
-- ⏳ M2: `rpgp` bodies in `proton-drive-crypto` (SEIPDv1 path)
-- ⏳ M3: real `my_files_root` / `iter_folder_children` against the API
-- ⏳ M4/M5: upload + download
-- ⏳ M6: event subscription
-- ⏳ M7: pdtui v0.1.0
+- ◐ M1: protobuf codegen in `proton-drive-api` (build-time, from `cs/sdk/protos`).
+  OpenAPI codegen deferred — REST DTOs stay hand-written until the specs are
+  vendored into this repo.
+- ✅ M2: `rpgp` bodies in `proton-drive-crypto` (SEIPDv1 path), SRP verifier,
+  SKESK password session keys
+- ✅ M3: real `my_files_root` / `iter_folder_children` against the API
+- ✅ M4/M5: upload + download (byte-identical round-trip)
+- ✅ M6: event subscription (volume light-events v2 polling loop)
+- ✅ M7: pdtui v0.1.0
 
-See PRD §8 for the milestone table.
+Known gaps: nested-file download (root-level only), and the items in the
+unaudited-MVP disclaimer above. See PRD §8 for the milestone table.

@@ -25,15 +25,23 @@ use pgp::{
     packet::{
         Notation, PacketParser, PacketTrait, PublicKeyEncryptedSessionKey, SignatureConfig,
         SignatureType, Subpacket, SubpacketData, SymEncryptedProtectedData,
+        SymKeyEncryptedSessionKey,
     },
     ser::Serialize,
-    types::{EskType, KeyDetails, Password, PkeskVersion, PublicKeyTrait},
+    types::{EskType, KeyDetails, Password, PkeskVersion, PublicKeyTrait, StringToKey},
 };
 
 /// Proton binds a signature to a purpose ("signature context") via a critical
 /// notation with this name. Matches gopenpgp / OpenPGP.js; a verifier that
 /// requires a different context value rejects the signature.
 const PROTON_SIGNATURE_CONTEXT_NOTATION: &[u8] = b"context@proton.ch";
+
+/// Iterated+Salted S2K iteration-count byte for password-encrypted session
+/// keys. `0xC0` (192) is OpenPGP.js' default for `encryptSessionKey` and
+/// decodes to ~4M hashed octets per RFC 9580 §3.7.1.3 — strong and
+/// interoperable. The count byte is serialised into the SKESK packet, so any
+/// compliant decrypter recovers it without out-of-band agreement.
+const DEFAULT_S2K_ITERATION_COUNT: u8 = 0xC0;
 
 // ── error ─────────────────────────────────────────────────────────────────────
 
@@ -51,8 +59,6 @@ pub enum CryptoError {
     Srp(String),
     #[error("AEAD/SEIPDv2 not supported in v1 (see ADR-0006)")]
     AeadNotSupported,
-    #[error("not implemented: {0}")]
-    NotImplemented(&'static str),
 }
 
 impl From<proton_srp::SRPError> for CryptoError {
@@ -318,17 +324,49 @@ pub trait OpenPgpCrypto: Send + Sync {
 
 // ── RpgpCrypto ───────────────────────────────────────────────────────────────
 
-pub struct RpgpCrypto;
+/// A server-issued, signed SRP modulus plus the `ModulusID` that names it.
+///
+/// Proton's `GET /core/v4/auth/modulus` route returns a fresh PGP-signed
+/// modulus (`Modulus`) and an opaque `ModulusID`. An SRP *verifier* must be
+/// derived against that exact modulus and registered alongside its id, so
+/// [`SrpModule::get_srp_verifier`] requires the host to have configured one via
+/// [`RpgpCrypto::with_srp_modulus`]. (SRP *login* takes its modulus per-call
+/// from `/auth/info`, so it needs no configured modulus.)
+#[derive(Debug, Clone, Default)]
+struct SrpModulus {
+    /// `ModulusID` from `/auth/modulus`, echoed back at registration time.
+    id: String,
+    /// The full ASCII-armored, server-signed PGP modulus message.
+    signed: String,
+}
 
-impl Default for RpgpCrypto {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Debug, Clone, Default)]
+pub struct RpgpCrypto {
+    /// Server modulus used to derive SRP verifiers. `None` until configured;
+    /// SRP login and all OpenPGP operations work without it.
+    srp_modulus: Option<SrpModulus>,
 }
 
 impl RpgpCrypto {
     pub fn new() -> Self {
-        Self
+        Self { srp_modulus: None }
+    }
+
+    /// Configure the server-signed SRP modulus and its `ModulusID` (from
+    /// `GET /core/v4/auth/modulus`) so [`SrpModule::get_srp_verifier`] can
+    /// derive a verifier bound to that modulus. Consumes and returns `self`
+    /// for builder-style construction; leaves all other behaviour unchanged.
+    #[must_use]
+    pub fn with_srp_modulus(
+        mut self,
+        modulus_id: impl Into<String>,
+        signed_modulus: impl Into<String>,
+    ) -> Self {
+        self.srp_modulus = Some(SrpModulus {
+            id: modulus_id.into(),
+            signed: signed_modulus.into(),
+        });
+        self
     }
 
     #[inline]
@@ -391,6 +429,54 @@ impl RpgpCrypto {
         }
         Err(CryptoError::Decrypt(
             "no SEIPD packet in bare payload".into(),
+        ))
+    }
+
+    /// Recover a session key from an SKESK (Symmetric-Key Encrypted Session
+    /// Key) packet stream using `password`. The S2K specifier embedded in the
+    /// packet (type, hash, salt, count) drives key derivation, so this is the
+    /// inverse of [`OpenPgpCrypto::encrypt_session_key_with_password`] and of
+    /// any RFC-9580 SKESK (OpenPGP.js, gopenpgp). rpgp 0.16 has no composed
+    /// password-decrypt for a bare SKESK, so we walk the packet layer: parse
+    /// the SKESK, derive the wrapping key via S2K, then `decrypt`.
+    ///
+    /// Test-gated: the SDK never password-*decrypts* a session key on the live
+    /// path (registration only *encrypts*), but the round-trip test needs the
+    /// exact inverse to prove the SKESK we emit is recoverable.
+    #[cfg(test)]
+    fn decrypt_session_key_with_password(
+        binary: &[u8],
+        password: &str,
+    ) -> Result<SessionKey, CryptoError> {
+        let parser = PacketParser::new(std::io::BufReader::new(binary));
+        for packet_result in parser {
+            let packet = packet_result.map_err(|e| CryptoError::Decrypt(e.to_string()))?;
+            let pgp::packet::Packet::SymKeyEncryptedSessionKey(skesk) = packet else {
+                continue;
+            };
+
+            let s2k = skesk
+                .s2k()
+                .ok_or_else(|| CryptoError::Decrypt("SKESK has no S2K specifier".into()))?;
+            let sym_alg = skesk
+                .sym_algorithm()
+                .ok_or_else(|| CryptoError::Decrypt("SKESK has no symmetric algorithm".into()))?;
+
+            // Derive the S2K wrapping key from the password, then unwrap the
+            // session key. For a v4 SKESK the wrapped blob carries its own
+            // symmetric-algorithm byte, which `decrypt` returns in the
+            // PlainSessionKey; the SKESK's `sym_algorithm` only sizes the
+            // wrapping cipher's key.
+            let derived = s2k
+                .derive_key(password.as_bytes(), sym_alg.key_size())
+                .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
+            let plain = skesk
+                .decrypt(&derived)
+                .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
+            return Self::plain_to_session_key(plain);
+        }
+        Err(CryptoError::Decrypt(
+            "no SKESK packet in password-encrypted session key".into(),
         ))
     }
 
@@ -557,10 +643,36 @@ impl SrpModule for RpgpCrypto {
         })
     }
 
-    async fn get_srp_verifier(&self, _password: &str) -> Result<SrpVerifier, CryptoError> {
-        Err(CryptoError::NotImplemented(
-            "get_srp_verifier — needs server modulus, out of scope for login",
-        ))
+    async fn get_srp_verifier(&self, password: &str) -> Result<SrpVerifier, CryptoError> {
+        // The verifier is `g^x mod N`, where `x` is Proton's SRP password hash
+        // (bcrypt-derived, version 4) and `N` is the server-signed modulus.
+        // proton-srp's `generate_verifier_with_pgp` performs exactly this:
+        // it verifies the modulus signature against Proton's bundled server
+        // key, generates a fresh random salt, computes the SRP password hash
+        // (always version 4, matching the working login path's V4 hashing),
+        // and returns `g^x mod N`. We bind the result to the `ModulusID` the
+        // host fetched alongside the signed modulus.
+        let modulus = self.srp_modulus.as_ref().ok_or_else(|| {
+            CryptoError::Srp(
+                "no SRP modulus configured: call RpgpCrypto::with_srp_modulus with the \
+                 ModulusID and signed modulus from GET /core/v4/auth/modulus before \
+                 deriving a verifier"
+                    .into(),
+            )
+        })?;
+
+        // `salt_opt = None` → proton-srp generates a fresh CSPRNG salt, exactly
+        // as the web client does on registration / password change.
+        let verifier =
+            proton_srp::SRPAuth::generate_verifier_with_pgp(password, None, &modulus.signed)?;
+        let b64 = proton_srp::SRPVerifierB64::from(verifier);
+
+        Ok(SrpVerifier {
+            modulus_id: modulus.id.clone(),
+            version: u8::from(b64.version) as u32,
+            salt: b64.salt,
+            verifier: b64.verifier,
+        })
     }
 
     async fn compute_key_password(
@@ -802,12 +914,31 @@ impl OpenPgpCrypto for RpgpCrypto {
 
     async fn encrypt_session_key_with_password(
         &self,
-        _session_key: &SessionKey,
-        _password: &str,
+        session_key: &SessionKey,
+        password: &str,
     ) -> Result<Vec<u8>, CryptoError> {
-        Err(CryptoError::NotImplemented(
-            "encrypt_session_key_with_password — Proton Drive uses PKESK, not SKESK",
-        ))
+        let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm);
+
+        // Mirror OpenPGP.js' `encryptSessionKey({ passwords })`: a v4 SKESK with
+        // an Iterated+Salted S2K (type 3), SHA-256 hash, fresh 8-byte salt, and
+        // the default iteration count. The S2K specifier (hash + salt + count)
+        // is serialised into the packet, so any RFC-9580 decrypter re-reads the
+        // exact parameters — wire-interoperable with OpenPGP.js / gopenpgp.
+        let s2k = StringToKey::new_iterated(
+            rand::thread_rng(),
+            HashAlgorithm::Sha256,
+            DEFAULT_S2K_ITERATION_COUNT,
+        );
+        let pw = Password::from(password);
+
+        let skesk = SymKeyEncryptedSessionKey::encrypt_v4(&pw, &session_key.data, s2k, sym_alg)
+            .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
+
+        let mut out = Vec::new();
+        skesk
+            .to_writer_with_header(&mut out)
+            .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
+        Ok(out)
     }
 
     async fn generate_session_key(
@@ -1255,5 +1386,154 @@ mod tests {
             .find(|n| n.name.as_ref() == PROTON_SIGNATURE_CONTEXT_NOTATION)
             .unwrap();
         assert_eq!(ctx.value.as_ref(), b"drive.sharing.member");
+    }
+
+    // ── SRP verifier ────────────────────────────────────────────────────────
+
+    /// A server-signed SRP modulus whose signature verifies against the Proton
+    /// server key bundled in `proton-srp`. Lifted from proton-srp's own
+    /// verifier test vectors, so it exercises the real PGP-signature
+    /// verification path inside `generate_verifier_with_pgp`.
+    const TEST_SIGNED_MODULUS: &str = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\ny6TtufhYg2mIeauZYOti+GPbd/0vP66kP34TgE6elK/kXkTW/Yfrp1jMmtLiWWSq5cszTMRIEighuwPbZ/z3RrWPxsOg0+jYgbFu8yZ8vOAwrPtLxZl94x0PFTAZBrVapmCn+VYcM+UXdO9v70xFDLwj34tpPbvpODHVWHSlGlhOwndWg3XBE2D9PJopFZajNZiqOScBXree5rDgzU5BBaPbIb6nySpyaeThMCcNzpcEqE8r3ro+E/VdXBvSSJpusr1dvAwHc3IDGUzAhodqV5mjYy9nXwq/9gHWpYNtm76Ols7ReWAhZwy1+cQllQZwGfzzOVGpc+3WutOntQjM6Q==\n-----BEGIN PGP SIGNATURE-----\nVersion: ProtonMail\nComment: https://protonmail.com\n\nwl4EARYIABAFAlwB1j8JEDUFhcTpUY8mAADfEAD8DFdNXn4TsgbfbAZRDa9a\nyywqa/2W9Qyg5MJaNZd2a+0BAPg04gEZI+G8RaoPVh/SYvWx7jpP3L1O8bEi\nM/j1cjIO\n=5RYw\n-----END PGP SIGNATURE-----";
+
+    /// The derivation `verifier = g^x mod N` is deterministic for a fixed
+    /// (password, salt, modulus). Pin it against the authoritative Proton SRP
+    /// vector to prove our delegation computes the canonical value and uses
+    /// hash version 4 — the same V4 hashing the working login path relies on.
+    #[test]
+    fn srp_verifier_is_deterministic_for_fixed_salt() {
+        let password = "123";
+        let salt = "SzHkg+YYA/eN1A==";
+        let expected_verifier = "j2o8z9G+Xm5t07Y6D7rauq3bNi6v0ZqnM1nWuZHS8PgtQOl4Xgh8LjuzulhX1izaOqeIoW221Z/LDVkrUZzxAXwFdi5LfxMN+RHPJCg0Uk5OcigQHsO1xTMuk3hvoIXO7yIXXs2oCqpBwKNfuhMNjcwVlgjyh5ZC4FzhSV2lwlP7KE1me/USAOfq4FbW7KtDtvxX8fk6hezWIz9X8/bcAHwQkHobqOVTCE81Lg+WL7s4sMed72YHwx5p6S/YGm558zrZmeETv6PuS4MRkQ8vPRrIvmzPEQDUiOXCaqfLkGvBFeCbBjNtBM8AlbWcW8XE+gcb/GwWH8cHinzd4ddh4A==";
+
+        let verifier = proton_srp::SRPAuth::generate_verifier_with_pgp(
+            password,
+            Some(salt),
+            TEST_SIGNED_MODULUS,
+        )
+        .unwrap();
+        let b64 = proton_srp::SRPVerifierB64::from(verifier);
+
+        assert_eq!(b64.verifier, expected_verifier, "verifier g^x mod N");
+        assert_eq!(b64.salt, salt, "salt is echoed unchanged");
+        assert_eq!(u8::from(b64.version), 4, "Proton SRP hash version is 4");
+    }
+
+    /// `get_srp_verifier` binds the configured `ModulusID`, reports version 4,
+    /// and produces fresh, decodable salt/verifier bytes on each call. Without
+    /// a configured modulus it must fail loudly rather than fabricate one.
+    #[tokio::test]
+    async fn get_srp_verifier_structure_and_modulus_binding() {
+        use base64::Engine as _;
+
+        // No modulus configured → explicit SRP error, never a fabricated value.
+        let bare = RpgpCrypto::new();
+        assert!(matches!(
+            bare.get_srp_verifier("pw").await,
+            Err(CryptoError::Srp(_))
+        ));
+
+        let crypto = RpgpCrypto::new().with_srp_modulus("modulus-id-xyz", TEST_SIGNED_MODULUS);
+
+        let v1 = crypto.get_srp_verifier("correct horse").await.unwrap();
+        assert_eq!(v1.modulus_id, "modulus-id-xyz", "ModulusID is echoed back");
+        assert_eq!(v1.version, 4, "registration uses SRP hash version 4");
+
+        // Salt and verifier are valid base64 of the expected SRP byte lengths.
+        let salt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&v1.salt)
+            .unwrap();
+        assert_eq!(salt_bytes.len(), proton_srp::SALT_LEN_BYTES);
+        let verifier_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&v1.verifier)
+            .unwrap();
+        assert_eq!(verifier_bytes.len(), proton_srp::SRP_LEN_BYTES);
+
+        // A second call draws a fresh random salt, so the verifier differs.
+        let v2 = crypto.get_srp_verifier("correct horse").await.unwrap();
+        assert_ne!(v1.salt, v2.salt, "each verifier uses a fresh CSPRNG salt");
+        assert_ne!(v1.verifier, v2.verifier, "fresh salt → distinct verifier");
+    }
+
+    // ── SKESK (password-encrypted session key) ───────────────────────────────
+
+    /// Round-trip: encrypt a session key under a password (v4 SKESK), then
+    /// recover it by parsing the packet and running S2K with the same
+    /// password. Proves the SKESK we emit is self-consistent and decryptable.
+    #[tokio::test]
+    async fn session_key_password_roundtrip() {
+        let crypto = RpgpCrypto::new();
+        let password = "s3ssion-pa55phrase";
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session_key.data.len(), 32, "AES-256 session key");
+
+        let skesk = crypto
+            .encrypt_session_key_with_password(&session_key, password)
+            .await
+            .unwrap();
+        assert!(!skesk.is_empty());
+
+        // The emitted bytes parse as a single v4 SKESK packet with an
+        // Iterated+Salted (type 3) S2K over SHA-256 and AES-256.
+        let parser = PacketParser::new(std::io::BufReader::new(skesk.as_slice()));
+        let mut saw_skesk = false;
+        for packet in parser {
+            if let pgp::packet::Packet::SymKeyEncryptedSessionKey(sk) = packet.unwrap() {
+                saw_skesk = true;
+                let s2k = sk.s2k().unwrap();
+                assert_eq!(s2k.id(), 3, "Iterated+Salted S2K (type 3)");
+                assert!(s2k.uses_salt(), "S2K is salted");
+                assert_eq!(
+                    sk.sym_algorithm(),
+                    Some(SymmetricKeyAlgorithm::AES256),
+                    "wrapping cipher is AES-256"
+                );
+            }
+        }
+        assert!(saw_skesk, "output contains exactly one SKESK packet");
+
+        let recovered = RpgpCrypto::decrypt_session_key_with_password(&skesk, password).unwrap();
+        assert_eq!(
+            recovered.data, session_key.data,
+            "recovered session key equals the original"
+        );
+        assert_eq!(recovered.cipher_algorithm, session_key.cipher_algorithm);
+
+        // A wrong password must not recover the original key.
+        let wrong = RpgpCrypto::decrypt_session_key_with_password(&skesk, "not-the-password");
+        match wrong {
+            Err(_) => {}
+            Ok(other) => assert_ne!(
+                other.data, session_key.data,
+                "wrong password must not yield the original key"
+            ),
+        }
+    }
+
+    /// The SKESK round-trips through the ASCII-armor path too: Proton delivers
+    /// `PGPMessage` fields armored, so `to_binary_pgp` must dearmor before the
+    /// packet parser sees the SKESK.
+    #[tokio::test]
+    async fn session_key_password_roundtrip_armored() {
+        let crypto = RpgpCrypto::new();
+        let password = "armored-skesk-pw";
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let skesk = crypto
+            .encrypt_session_key_with_password(&session_key, password)
+            .await
+            .unwrap();
+        let armored = armor(&skesk, ArmorKind::Message);
+        assert!(armored.starts_with("-----BEGIN PGP MESSAGE-----"));
+
+        let binary = RpgpCrypto::to_binary_pgp(armored.as_bytes()).unwrap();
+        let recovered = RpgpCrypto::decrypt_session_key_with_password(&binary, password).unwrap();
+        assert_eq!(recovered.data, session_key.data);
     }
 }

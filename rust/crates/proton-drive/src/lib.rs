@@ -11,9 +11,11 @@
 pub use proton_drive_cache::{MemoryCache, ProtonDriveCache};
 pub use proton_drive_core::{
     Author, CachedCryptoMaterial, DriveEvent, DriveListener, Error, EventSubscription,
-    FileDownloader, FileUploader, FolderChildrenFilter, MaybeNode, Node, NodeType, NodeUid,
+    FastForwardEvent, FileDownloader, FileUploader, FolderChildrenFilter, InMemoryLatestEventId,
+    LatestEventIdProvider, MaybeNode, Node, NodeEvent, NodeEventKind, NodeType, NodeUid,
     ProtonDriveAccount, ProtonDriveClient, ProtonDriveClientOptions, ProtonDriveConfig,
-    ProtonDriveHttpClient, Result, Revision, UploadController, UploadMetadata, http, make_node_uid,
+    ProtonDriveHttpClient, Result, Revision, TreeRefreshEvent, TreeRemovalEvent, UploadController,
+    UploadMetadata, http, make_node_uid,
 };
 pub use proton_drive_crypto::{OpenPgpCrypto, RpgpCrypto, SessionKey, SrpModule};
 pub use proton_drive_telemetry::{MetricEvent, NullTelemetry, Telemetry};

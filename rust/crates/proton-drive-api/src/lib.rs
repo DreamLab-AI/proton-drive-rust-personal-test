@@ -15,6 +15,48 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Protobuf wire types, generated at build time from the cross-language
+/// `.proto` sources in `cs/sdk/src/protos` (the source of truth shared with the
+/// C#/Kotlin/Swift implementations). Codegen runs in `build.rs`: a bundled
+/// `protoc` (via `protoc-bin-vendored`) compiles the editions protos to a
+/// `FileDescriptorSet`, which is relabelled to proto3 and fed to `prost-build`;
+/// the output lands in `OUT_DIR` and is pulled in with `include!` below.
+///
+/// These types are **additive** and entirely separate from the hand-written
+/// JSON REST DTOs in this crate's other modules — the REST surface is driven by
+/// Proton's HTTP API, which is described by OpenAPI specs that live **outside**
+/// this repository (`api/openapi-*.json`). Generating Rust from those specs is
+/// deferred until the specs are vendored here; the REST DTOs therefore remain
+/// hand-written and are not touched by this protobuf codegen.
+///
+/// Two protobuf packages are generated:
+/// - `proton.sdk` → `proto::proton::sdk`
+/// - `proton.drive.sdk` → `proto::proton::drive::sdk`
+// `large_enum_variant` fires on prost-generated `oneof` enums (`Node`,
+// `DegradedNode`); the wire layout is fixed by the schema, so it is not ours to
+// "box". Scoped to the generated module only.
+#[allow(clippy::large_enum_variant)]
+pub mod proto {
+    /// Module tree mirrors the protobuf package components so prost's
+    /// cross-package references (e.g. `proton.drive.sdk` -> `proton.sdk.Error`,
+    /// emitted as `super::super::sdk::Error`) resolve.
+    pub mod proton {
+        /// `package proton.sdk;` — base SDK primitives (sessions, HTTP,
+        /// telemetry, errors, addresses).
+        pub mod sdk {
+            include!(concat!(env!("OUT_DIR"), "/proton.sdk.rs"));
+        }
+
+        /// `package proton.drive.sdk;` — Drive-specific request/response
+        /// messages (nodes, uploads, downloads, photos).
+        pub mod drive {
+            pub mod sdk {
+                include!(concat!(env!("OUT_DIR"), "/proton.drive.sdk.rs"));
+            }
+        }
+    }
+}
+
 pub mod common {
     use super::*;
 
@@ -507,37 +549,7 @@ pub mod download {
     }
 }
 
-pub mod events {
-    use super::*;
-
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    pub struct GetLatestEventIdResponse {
-        #[serde(rename = "EventID")]
-        pub event_id: String,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    pub struct GetEventsResponse {
-        #[serde(rename = "EventID")]
-        pub event_id: String,
-        pub events: Vec<EventEntry>,
-        pub more: u8,
-        pub refresh: u8,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    pub struct EventEntry {
-        #[serde(rename = "EventID")]
-        pub event_id: String,
-        pub event_type: u8, // 0 delete, 1 create, 2 update, 3 update_metadata
-        pub created_time: i64,
-        #[serde(default)]
-        pub link: Option<super::nodes::Link>,
-    }
-}
+pub mod events;
 
 pub mod auth {
     use super::*;
@@ -940,5 +952,113 @@ mod tests {
         assert!(obj.contains_key("Photo"));
         assert!(obj["Photo"].is_null(), "non-photo upload sends Photo: null");
         assert_eq!(obj["ChecksumVerified"], true);
+    }
+}
+
+/// Proves the build-time protobuf codegen produces usable, wire-correct types:
+/// constructs representative generated messages and round-trips them through
+/// `prost::Message` encode/decode, including a cross-package reference
+/// (`proton.drive.sdk` -> `proton.sdk.Error`) and a well-known type
+/// (`google.protobuf.Timestamp`).
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod proto_tests {
+    use prost::Message as _;
+
+    use crate::proto::proton::{drive, sdk};
+
+    #[test]
+    fn roundtrip_proton_sdk_error_with_enum_and_nested() {
+        let original = sdk::Error {
+            r#type: "ApiError".to_owned(),
+            message: "rate limited".to_owned(),
+            domain: sdk::ErrorDomain::Api as i32,
+            primary_code: 429,
+            secondary_code: 2028,
+            context: "upload".to_owned(),
+            inner_error: Some(Box::new(sdk::Error {
+                message: "retry exhausted".to_owned(),
+                domain: sdk::ErrorDomain::Network as i32,
+                ..Default::default()
+            })),
+            additional_data: None,
+        };
+
+        let bytes = original.encode_to_vec();
+        let decoded = sdk::Error::decode(bytes.as_slice()).expect("decode proton.sdk.Error");
+
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.domain(), sdk::ErrorDomain::Api);
+        assert_eq!(
+            decoded.inner_error.as_ref().map(|e| e.domain()),
+            Some(sdk::ErrorDomain::Network)
+        );
+    }
+
+    #[test]
+    fn roundtrip_drive_node_result_references_sdk_error() {
+        // Exercises the cross-package generated reference
+        // (`proton.drive.sdk.NodeResultPair.error: proton.sdk.Error`).
+        let original = drive::sdk::NodeResultListResponse {
+            results: vec![
+                drive::sdk::NodeResultPair {
+                    node_uid: "node-ok".to_owned(),
+                    error: None,
+                },
+                drive::sdk::NodeResultPair {
+                    node_uid: "node-bad".to_owned(),
+                    error: Some(sdk::Error {
+                        message: "trash failed".to_owned(),
+                        domain: sdk::ErrorDomain::BusinessLogic as i32,
+                        ..Default::default()
+                    }),
+                },
+            ],
+        };
+
+        let bytes = original.encode_to_vec();
+        let decoded = drive::sdk::NodeResultListResponse::decode(bytes.as_slice())
+            .expect("decode NodeResultListResponse");
+
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.results.len(), 2);
+        assert!(decoded.results[0].error.is_none());
+        assert_eq!(
+            decoded.results[1]
+                .error
+                .as_ref()
+                .map(|e| e.message.as_str()),
+            Some("trash failed")
+        );
+    }
+
+    #[test]
+    fn roundtrip_drive_upload_result_with_timestamp() {
+        // Pairs a flat Drive message with a well-known-type field to prove the
+        // `google.protobuf.Timestamp` import generates and round-trips.
+        let upload = drive::sdk::UploadResult {
+            node_uid: "uid-1".to_owned(),
+            revision_uid: "rev-1".to_owned(),
+        };
+        let decoded =
+            drive::sdk::UploadResult::decode(upload.encode_to_vec().as_slice()).expect("decode");
+        assert_eq!(decoded, upload);
+
+        let revision = drive::sdk::FileRevision {
+            uid: "rev-1".to_owned(),
+            creation_time: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+            size_on_cloud_storage: 4096,
+            ..Default::default()
+        };
+        let decoded_rev = drive::sdk::FileRevision::decode(revision.encode_to_vec().as_slice())
+            .expect("decode FileRevision");
+        assert_eq!(decoded_rev, revision);
+        assert_eq!(
+            decoded_rev.creation_time.map(|t| t.seconds),
+            Some(1_700_000_000)
+        );
     }
 }

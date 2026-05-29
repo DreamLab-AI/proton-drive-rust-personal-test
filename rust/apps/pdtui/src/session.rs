@@ -125,7 +125,7 @@ impl Session {
         // clobber the developer's real `~/.config/pdtui/` session.
         #[cfg(test)]
         {
-            return TEST_CONFIG_DIR.join("session.json");
+            TEST_CONFIG_DIR.join("session.json")
         }
         #[cfg(not(test))]
         {
