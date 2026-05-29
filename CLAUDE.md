@@ -2,87 +2,84 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## What this repository is
+
+A **Rust implementation of the Proton Drive SDK plus `pdtui`** (a two-pane
+terminal file browser), built for personal use against the owner's own Proton
+Drive account. The Rust project under [`rust/`](./rust/) is the primary
+codebase. The upstream native SDKs (TypeScript, C#, Kotlin, Swift) that the port
+follows for wire-format fidelity live under [`reference/`](./reference/) and are
+read-only reference, not the focus of work here.
+
+Status: working MVP, **unaudited**. The full crypto-backed transfer path is
+live-validated (SRP login → list → upload → byte-identical download), including
+nested files and large real-world content. Always disclaim the unaudited status
+honestly; never claim audit-grade security.
+
 ## Repository Layout
 
-Multi-language monorepo for the Proton Drive SDK. Four sibling trees, two implementations:
+| Path | Contents |
+|---|---|
+| `rust/` | The project — Cargo workspace (edition 2024). SDK crates `proton-drive-*` + the `pdtui` app under `rust/apps/pdtui/`. |
+| `docs/` | PRDs, domain model, ADRs (`docs/adr/`) for the port. |
+| `tests/fixtures/wire/` | Cross-language wire-format fixtures; consumed by `rust/crates/proton-drive-crypto/tests/wire_format.rs` via a repo-root-relative path (`../../../tests/fixtures/wire`). **Do not move.** |
+| `scripts/` | Dev tooling: `setup.sh` (gate), `configure-session.sh`, `run-probes.sh`, `js-probe.mjs` (JS cross-check). |
+| `reference/` | Upstream Proton SDKs — `reference/{js,cs,kt,swift}`. Wire-format source of truth. |
 
-- `js/sdk/` — **TypeScript native SDK** (`@protontech/drive-sdk` on npm). Independent implementation.
-- `cs/sdk/` — **C# native SDK** (.NET 10, AOT-capable). Independent implementation.
-- `kt/sdk/` — **Kotlin bindings** wrapping the C# SDK via JNI (`src/main/jni/*.c` + `jniLibs/`).
-- `swift/ProtonDriveSDK/` — **Swift bindings** wrapping the C# SDK via the C ABI (`cs/headers/*.h`).
+## Build & Test (the Rust project)
 
-The C SDK exposes a C ABI via `cs/sdk/src/Proton.{Drive.,}Sdk.CExports/` and `cs/headers/proton_*.h`. Kotlin/Swift do not duplicate business logic — they marshal calls into the AOT-compiled C# native library. JS is fully independent.
+All commands run from `rust/`.
 
-Cross-language wire types are defined as protobufs in `cs/sdk/src/protos/`.
-
-The C# changelog (`cs/CHANGELOG.md`) is the source of truth for kt/swift releases; JS has its own (`js/CHANGELOG.md`).
-
-## Build & Test Commands
-
-### TypeScript (`js/sdk/`)
 ```bash
-npm install
-npm run build              # tsc -> dist/
-npm run check-types        # type-check only
-npm test                   # jest
-npm test -- path/to/file.test.ts                  # single file
-npm test -- -t "test name pattern"                # by test name
-npm run test:watch
-npm run lint
-npm run lint:ttag          # validate ttag i18n usage
-npm run generate-types     # regenerate OpenAPI client types from ../../api/openapi-*.json
-npm run generate-doc:interface  # OUTPUT_PATH=./doc required
+cargo build --release -p pdtui     # build the TUI/CLI binary
+cargo test --workspace             # unit + wire-fixture tests
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all                    # (CI runs --check)
+
+./target/release/pdtui login       # live SRP login → OS keyring
+./target/release/pdtui mvp         # headless live round-trip acceptance test
+./target/release/pdtui             # interactive two-pane browser
 ```
-OpenAPI source files (`api/openapi-drive.json`, `api/openapi-core.json`) live outside this repo — `generate-types` will fail in a standalone checkout.
 
-### C# (`cs/`)
-```bash
-dotnet build cs/Proton.Drive.Sdk.slnx
-dotnet test cs/Proton.Drive.Sdk.slnx
-dotnet test --filter "FullyQualifiedName~SomeTestClass"   # single test/class
-```
-Release builds treat warnings as errors (`cs/Directory.Build.props`). Target framework `net10.0`, AOT publishing enabled.
+Quality gate (run before committing):
+`cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
-### Kotlin (`kt/`)
-```bash
-./gradlew :sdk:build
-./gradlew :sdk:test
-```
-JNI sources in `kt/sdk/src/main/jni/` bind to the C# native library shipped under `jniLibs/`.
+The `proton-drive-api` crate runs **build-time protobuf codegen** from
+`reference/cs/sdk/src/protos/` (see `rust/crates/proton-drive-api/build.rs`).
+Moving `reference/cs` requires updating that path.
 
-### Swift (`swift/ProtonDriveSDK/`)
-Standard SwiftPM (`swift build`, `swift test`). Links against the C# AOT artifact via `cs/headers/module.modulemap`.
+### Rust guardrails (non-negotiable)
+- `unwrap_used` / `expect_used` / `panic` are **denied workspace-wide** for
+  runtime code. Test modules opt out with `#[allow(...)]`; the `build.rs` opts
+  out because a build script *should* abort loudly.
+- The crypto trait seam is the only boundary that may touch `pgp::*` — direct
+  `pgp` references outside `proton-drive-crypto` are a bug.
+- DTOs are JSON, not protobuf. The `reference/cs/sdk/src/protos/` files exist for
+  C-ABI marshalling to kt/swift and as the Rust wire-type codegen source only.
+- No polling. Event subscription is the only sync mechanism.
 
-## Architecture
-
-### TypeScript SDK (`js/sdk/src/`)
-Entry point is `ProtonDriveClient` (`protonDriveClient.ts`), plus `ProtonDrivePhotosClient` and `ProtonDrivePublicLinkClient`. Only symbols re-exported from `src/index.ts` are public API — everything under `internal/` can change without warning.
-
-- `interface/` — public types & contracts the embedding app implements (`httpClient`, `account`, `featureFlags`, etc.). The SDK does **not** provide authentication, session management, or user-address resolution; the host wires these in.
-- `internal/` — implementation. Subdirectories mirror domain concerns: `nodes/`, `shares/`, `sharing/`, `sharingPublic/`, `devices/`, `events/`, `upload/`, `download/`, `photos/`, `apiService/`.
-- `internal/apiService/{drive,core}Types.ts` — generated; do not hand-edit (excluded from lint).
-- `crypto/` — `OpenPGPCrypto` interface + `OpenPGPCryptoWithCryptoProxy` adapter. Crypto module is injected by the host.
-- `cache/` — pluggable cache (`MemoryCache` ships; hosts can implement persistent variants). Two caches required: `entitiesCache` and `cryptoCache`.
-- Construction requires `{ httpClient, entitiesCache, cryptoCache, account, openPGPCryptoModule }`.
-- Sync is **event-based** (`internal/events/`, `sdkEvents.ts`); never poll or recursively traverse the tree.
-- i18n via `ttag`; `npm run lint:ttag` enforces correct usage.
-
-### C# SDK (`cs/sdk/src/`)
-Two layered projects:
-- `Proton.Sdk` / `Proton.Sdk.CExports` — base Proton SDK primitives (HTTP, crypto, telemetry, resilience).
-- `Proton.Drive.Sdk` / `Proton.Drive.Sdk.CExports` — Drive-specific client (`ProtonDriveClient`, `ProtonPhotosClient`, nodes, shares, uploads/downloads).
-
-The `*.CExports` projects produce the C ABI consumed by Kotlin/Swift. `Interop*` types adapt managed APIs to flat C-callable shapes. Native library lookup is centralised in `NativeLibraryResolver.cs`.
-
-### Operational constraints (apply to all implementations)
-- Set `x-pm-appversion` header as `external-drive-{name}@{semver}-{channel}[+suffix]`.
+## Operational constraints (apply to any Proton Drive client, including pdtui)
+- `x-pm-appversion` is `external-drive-pdtui@{semver}-stable`. Never spoof a
+  first-party header.
 - All HTTP must hit official Proton endpoints — no proxying.
-- Rate limits are shared with first-party clients; respect caching, backoff, parallelism limits.
-- A breaking cryptographic-model migration is targeted late-2026/early-2027 (see root README).
+- Rate limits are shared with first-party clients; respect caching, backoff,
+  parallelism limits.
+- A breaking cryptographic-model migration is targeted late-2026/early-2027.
+- Personal use only — no publishing to crates.io, no binary releases (ADR-0007).
 
-## When Modifying
+## Reference SDKs (`reference/`, read-only context)
 
-- TS public surface: if changes affect `src/index.ts` re-exports or anything under `src/interface/`, update `js/CHANGELOG.md`.
-- C# public surface or anything exposed via `*.CExports`: update `cs/CHANGELOG.md` (covers kt + swift releases).
-- Touching `internal/apiService/*Types.ts` by hand is wrong — regenerate via `npm run generate-types`.
-- Touching the C ABI (`cs/headers/*.h` or `*.CExports/Interop*.cs`) requires coordinated updates to `kt/sdk/src/main/jni/*.c` and the Swift `Plumbing/`/`Client/` layers.
+Independent upstream implementations the port mirrors. Touch only when checking
+wire-format ground truth; the JS SDK is the primary behavioural reference for
+the Rust port (see ADR-0001).
+
+- **TypeScript** — `reference/js/sdk/`. Entry `ProtonDriveClient`
+  (`protonDriveClient.ts`); only `src/index.ts` re-exports are public API,
+  `internal/` mirrors domain concerns (`nodes/`, `upload/`, `download/`,
+  `events/`, `apiService/`). Crypto + cache + account are host-injected.
+  Changelog `reference/js/CHANGELOG.md`.
+- **C#** — `reference/cs/sdk/`. `Proton.Sdk` (base) + `Proton.Drive.Sdk`
+  (Drive). `*.CExports` produce the C ABI for kt/swift. Changelog
+  `reference/cs/CHANGELOG.md` (source of truth for kt/swift).
+- **Kotlin / Swift** — `reference/kt/`, `reference/swift/ProtonDriveSDK/`.
+  Bindings over the C# AOT native library; no business logic of their own.

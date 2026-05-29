@@ -1,8 +1,9 @@
 //! Build-time protobuf code generation for the cross-language wire types.
 //!
-//! The two `.proto` files live in the shared C# tree (`cs/sdk/src/protos/`) and
-//! are the source of truth for the wire format used by the C#/Kotlin/Swift
-//! implementations. They declare `edition = "2023"` (protobuf editions), which
+//! The two `.proto` files live in the upstream C# reference tree
+//! (`reference/cs/sdk/src/protos/`) and are the source of truth for the wire
+//! format used by the C#/Kotlin/Swift implementations. They declare
+//! `edition = "2023"` (protobuf editions), which
 //! creates two constraints this script handles:
 //!
 //! 1. Parsing editions needs a modern `protoc` (>= v27). To keep the build
@@ -33,7 +34,7 @@ use std::path::Path;
 use prost::Message;
 use prost_types::FileDescriptorSet;
 
-const PROTO_INCLUDE: &str = "../../../cs/sdk/src/protos";
+const PROTO_INCLUDE: &str = "../../../reference/cs/sdk/src/protos";
 const PROTO_FILES: [&str; 2] = ["proton.drive.sdk.proto", "proton.sdk.proto"];
 
 fn main() {
@@ -46,7 +47,7 @@ fn main() {
         panic!(
             "proto include directory not found: {} (resolved from crate dir {}). \
              The cross-language wire `.proto` sources are expected at \
-             `cs/sdk/src/protos` relative to the repository root.",
+             `reference/cs/sdk/src/protos` relative to the repository root.",
             include.display(),
             env!("CARGO_MANIFEST_DIR"),
         );

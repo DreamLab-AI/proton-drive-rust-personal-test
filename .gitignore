@@ -5,7 +5,7 @@
 __pycache__
 docs/build
 /public
-js/public
+reference/js/public
 
 # JS
 node_modules
@@ -14,7 +14,7 @@ tsconfig.tsbuildinfo
 dist
 
 # JS CLI
-js/cli/release
+reference/js/cli/release
 auth.txt
 auth-session.json
 cache*.sqlite
@@ -51,3 +51,18 @@ Cargo.lock.bak
 rust/.env
 rust/fixtures/auth/*
 !rust/fixtures/auth/.gitkeep
+
+# Credentials / secrets (defensive — none of these belong in the repo).
+# pdtui keeps its live session in the OS keyring; configure-session.sh writes
+# session.json under $XDG_CONFIG_HOME/pdtui and probes write to $TMPDIR, all
+# outside the tree. These patterns guard against an accidental repo-local copy.
+.env
+.env.*
+session.json
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_rsa.pub
