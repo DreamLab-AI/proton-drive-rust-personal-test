@@ -14,6 +14,12 @@ The upstream native SDKs (TypeScript, C#, Kotlin, Swift) that this port follows
 for wire-format fidelity live under [`reference/`](./reference/) and remain the
 authoritative source for those languages.
 
+![pdtui (right) listing the same MVP round-trip files that the official Proton Drive web UI (left) shows — proof of a live upload/download against the real API.](rust/docs/pdtui-mvp-roundtrip.png)
+
+`pdtui` (right) beside the official Proton Drive web UI (left): the same
+`pdtui-mvp-*.txt` files appear in both panes, uploaded and downloaded
+byte-identically through the live Proton API.
+
 ## What works (live-validated)
 
 | Capability | State |
