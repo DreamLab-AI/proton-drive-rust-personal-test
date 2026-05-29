@@ -17,6 +17,12 @@ Scope and decisions live in [`../docs/PRD-rust-port-and-tui.md`](../docs/PRD-rus
 > access are largely untested. Do not rely on it for data you cannot afford to
 > lose or expose. No warranty of correctness, durability, or confidentiality.
 
+![pdtui (right) listing the same MVP round-trip files that the official Proton Drive web UI (left) shows — proof of a live upload/download against the real API.](docs/pdtui-mvp-roundtrip.png)
+
+`pdtui` (right) beside the official Proton Drive web UI (left): the same
+`pdtui-mvp-*.txt` files appear in both panes, uploaded and downloaded
+byte-identically through the live Proton API.
+
 ## Layout
 
 ```
