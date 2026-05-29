@@ -195,14 +195,19 @@ impl ProtonDriveClient {
     }
 
     /// Resolve the private key of a folder node, used to decrypt its children's
-    /// names. The chain is: address key → share key → parent node key.
-    ///
-    /// For the share root, the parent node passphrase is encrypted to the share
-    /// key. Nested folders would require walking the parent chain — deferred
-    /// (callers treat a failure here as "names undecryptable").
+    /// names. The chain is: address key → share key → root node key → … →
+    /// target node key. Each node's passphrase is encrypted to its *parent*
+    /// node's key; the share root's passphrase is encrypted to the share key.
+    /// Works for the share root and arbitrarily nested folders.
     async fn resolve_folder_node_key(&self, parent: &NodeUid) -> Result<PrivateKey> {
         let share_id = &parent.volume_id;
+        let share_priv = self.resolve_share_key(share_id).await?;
+        self.resolve_node_key_via_chain(share_id, &parent.node_id, &share_priv)
+            .await
+    }
 
+    /// Decrypt the share private key for `share_id` via the user's address key.
+    async fn resolve_share_key(&self, share_id: &str) -> Result<PrivateKey> {
         let share_resp: proton_drive_api::shares::GetShareResponse =
             self.api_get(&format!("/drive/shares/{share_id}")).await?;
         let share = share_resp.share;
@@ -210,25 +215,68 @@ impl ProtonDriveClient {
         let address_email = self.opts.account.primary_email();
         let address_key = self.opts.account.address_private_key(address_email).await?;
 
-        let share_priv = decrypt_share_key(
+        decrypt_share_key(
             &self.opts.openpgp,
             &share.key,
             &share.passphrase,
             &address_key,
         )
-        .await?;
-
-        let link_path = format!("/drive/shares/{share_id}/links/{}", parent.node_id);
-        let link_resp: proton_drive_api::nodes::GetLinkResponse = self.api_get(&link_path).await?;
-        let parent_link = link_resp.link;
-
-        decrypt_node_private_key(
-            &self.opts.openpgp,
-            &parent_link.node_key,
-            &parent_link.node_passphrase,
-            &share_priv,
-        )
         .await
+    }
+
+    /// Resolve a node's private key by walking the parent chain to the share
+    /// root and folding key derivation top-down.
+    ///
+    /// A node's `NodePassphrase` is encrypted to its **parent node's** key
+    /// (JS `getParentKeys`); only the share root's passphrase is encrypted to
+    /// the share key directly. To unlock an arbitrarily nested node we collect
+    /// the ancestor links bottom-up (target → … → root) by following
+    /// `ParentLinkID`, then derive keys top-down starting from `share_priv`.
+    ///
+    /// `MAX_CHAIN_DEPTH` guards against a malformed/cyclic parent chain.
+    async fn resolve_node_key_via_chain(
+        &self,
+        share_id: &str,
+        link_id: &str,
+        share_priv: &PrivateKey,
+    ) -> Result<PrivateKey> {
+        const MAX_CHAIN_DEPTH: usize = 64;
+
+        // Collect (node_key, node_passphrase) from the target up to the root.
+        let mut chain: Vec<(String, String)> = Vec::new();
+        let mut current_id = link_id.to_owned();
+
+        loop {
+            if chain.len() >= MAX_CHAIN_DEPTH {
+                return Err(Error::Internal(format!(
+                    "node key chain exceeded depth {MAX_CHAIN_DEPTH} (cyclic parent links?)"
+                )));
+            }
+
+            let path = format!("/drive/shares/{share_id}/links/{current_id}");
+            let resp: proton_drive_api::nodes::GetLinkResponse = self.api_get(&path).await?;
+            let link = resp.link;
+            let parent = link.parent_link_id.clone();
+            chain.push((link.node_key, link.node_passphrase));
+
+            match parent {
+                Some(p) => current_id = p,
+                None => break,
+            }
+        }
+
+        // Fold from the root down: the deepest ancestor (last pushed) unlocks
+        // with the share key, each descendant with its parent's node key.
+        let mut current: Option<PrivateKey> = None;
+        for (node_key, node_passphrase) in chain.iter().rev() {
+            let parent_ref: &PrivateKey = current.as_ref().unwrap_or(share_priv);
+            let next =
+                decrypt_node_private_key(&self.opts.openpgp, node_key, node_passphrase, parent_ref)
+                    .await?;
+            current = Some(next);
+        }
+
+        current.ok_or_else(|| Error::Internal("empty node key chain".into()))
     }
 
     /// Stream children of a folder as a `BoxStream`.
@@ -297,9 +345,9 @@ impl ProtonDriveClient {
     ///    `NodeUid.volume_id` from MC's listing holds a **share ID**, not the volume ID.
     ///    FIXME: NodeUid naming — see MC commit f6b29b1
     /// 3. Decrypt the share key (address_key → share passphrase → share private key).
-    /// 4. Decrypt the node private key (share_key → node passphrase → node private key).
-    ///    MVP restriction: only files directly under the share root are supported.
-    ///    For nested files, parent folder key derivation is needed — deferred.
+    /// 4. Decrypt the node private key by walking the parent chain to the share
+    ///    root (each node's passphrase is encrypted to its parent node's key).
+    ///    Supports root-level and arbitrarily nested files.
     /// 5. Build `FileDownloader` with resolved context.
     pub async fn file_downloader(&self, uid: &NodeUid) -> Result<FileDownloader> {
         // Step 1: re-fetch the link for active revision + key material.
@@ -338,86 +386,46 @@ impl ProtonDriveClient {
         // Step 2: resolve volume_id from share.
         let volume_id = resolve_volume_id(&self.opts.http_client, share_id).await?;
 
-        // Step 3: get the share metadata to decrypt the share key.
-        let share_resp: proton_drive_api::shares::GetShareResponse =
-            self.api_get(&format!("/drive/shares/{share_id}")).await?;
-        let share = share_resp.share;
-
-        // Decrypt share key using the user's address private key.
-        let address_email = self.opts.account.primary_email();
-        let address_key = self.opts.account.address_private_key(address_email).await?;
-
-        let share_priv = crate::download::decrypt_share_key(
-            &self.opts.openpgp,
-            &share.key,
-            &share.passphrase,
-            &address_key,
-        )
-        .await?;
+        // Step 3: decrypt the share key (address key → share passphrase).
+        let share_priv = self.resolve_share_key(share_id).await?;
 
         // Step 4: decrypt the file's node key. A node's `NodePassphrase` is
-        // encrypted to its *parent node* key (JS `getParentKeys`), not the
-        // share key directly. For a root-level file the parent is the share
-        // root folder, whose own passphrase is encrypted to the share key.
-        // MVP: only root-level files; deeper nesting needs a parent-chain walk.
-        let parent_link_id = link
-            .parent_link_id
-            .clone()
-            .ok_or_else(|| Error::Internal("file link missing ParentLinkID".into()))?;
-        let parent_link_path = format!("/drive/shares/{share_id}/links/{parent_link_id}");
-        let parent_link_resp: proton_drive_api::nodes::GetLinkResponse =
-            self.api_get(&parent_link_path).await?;
-        let parent_link = parent_link_resp.link;
+        // encrypted to its *parent node* key (JS `getParentKeys`), so we walk
+        // the parent chain to the share root and fold key derivation top-down.
+        // Works for root-level and arbitrarily nested files.
+        let node_priv = self
+            .resolve_node_key_via_chain(share_id, link_id, &share_priv)
+            .await?;
 
-        let parent_node_priv = crate::download::decrypt_node_private_key(
-            &self.opts.openpgp,
-            &parent_link.node_key,
-            &parent_link.node_passphrase,
-            &share_priv,
-        )
-        .await
-        .map_err(|_| {
-            Error::NotImplemented(
-                "nested file download — parent node key derivation required (MVP: root-level only)",
-            )
-        })?;
-
-        let node_priv = crate::download::decrypt_node_private_key(
-            &self.opts.openpgp,
-            &link.node_key,
-            &link.node_passphrase,
-            &parent_node_priv,
-        )
-        .await
-        .map_err(|e| Error::Decryption(format!("file node key: {e}")))?;
-
-        // Step 5: resolve the signer's public key. The account hands back a
-        // private key; derive the armored *public* key from it (a private-key
-        // block cannot be parsed as a verification key).
-        let signature_address_pub = if let Some(ref email) = signature_email {
-            match self.opts.account.address_private_key(email).await {
-                Ok(priv_key) => match self.opts.openpgp.public_key(&priv_key).await {
-                    Ok(pub_key) => Some(pub_key),
-                    Err(e) => {
-                        tracing::warn!(
-                            email = %email,
-                            "could not derive signature address public key: {e} — \
-                             signature verification will be skipped"
-                        );
-                        None
-                    }
-                },
+        // Step 5: resolve the signer's verification keys. The address keeps
+        // rotated-out keys alongside the current one, and a revision can be
+        // signed by any of them, so fetch the full public-key set (JS
+        // `getRevisionVerificationKeys` → `account.getPublicKeys`). Empty when
+        // there is no signer address — verify_manifest then falls back to the
+        // node's own public key.
+        let signature_address_pubs = if let Some(ref email) = signature_email {
+            match self.opts.account.address_public_keys(email).await {
+                Ok(keys) => {
+                    tracing::debug!(
+                        signer = %email,
+                        key_count = keys.len(),
+                        fingerprints = ?keys.iter().map(|k| &k.fingerprint_hex).collect::<Vec<_>>(),
+                        "resolved manifest verification keys for signer"
+                    );
+                    keys
+                }
                 Err(e) => {
                     tracing::warn!(
                         email = %email,
-                        "could not resolve signature address private key: {e} — \
-                         signature verification will be skipped"
+                        "could not resolve signature address public keys: {e} — \
+                         falling back to node-key verification"
                     );
-                    None
+                    Vec::new()
                 }
             }
         } else {
-            None
+            tracing::debug!("revision has no signer email — node-key verification fallback");
+            Vec::new()
         };
 
         // ContentKeyPacket is on the node (file link), not the revision.
@@ -434,7 +442,7 @@ impl ProtonDriveClient {
             share_id: share_id.clone(),
             revision_id,
             node_private_key: node_priv,
-            signature_address_pub,
+            signature_address_pubs,
             content_key_packet,
         })
     }

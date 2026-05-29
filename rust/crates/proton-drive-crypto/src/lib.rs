@@ -320,6 +320,14 @@ pub trait OpenPgpCrypto: Send + Sync {
     /// signature-verification fallback when no signer address is available
     /// (JS `getRevisionVerificationKeys` returns `[nodeKey]`).
     async fn public_key(&self, key: &PrivateKey) -> Result<PublicKey, CryptoError>;
+
+    /// Extract the public key from an armored private-key block **without
+    /// unlocking it** (no passphrase required — the public portion of a locked
+    /// secret key is plaintext). Proton addresses retain rotated-out keys
+    /// alongside the current one, and a revision may be signed by any of them,
+    /// so verification needs every address key's public portion. Mirrors the
+    /// full key list JS `account.getPublicKeys(email)` returns.
+    async fn public_key_from_armored(&self, armored: &str) -> Result<PublicKey, CryptoError>;
 }
 
 // ── RpgpCrypto ───────────────────────────────────────────────────────────────
@@ -1114,6 +1122,23 @@ impl OpenPgpCrypto for RpgpCrypto {
         Ok(PublicKey {
             armored,
             fingerprint_hex: key.fingerprint_hex.clone(),
+        })
+    }
+
+    async fn public_key_from_armored(&self, armored: &str) -> Result<PublicKey, CryptoError> {
+        let sec = Self::parse_secret_key(&PrivateKey {
+            armored: armored.to_owned(),
+            fingerprint_hex: String::new(),
+            passphrase: Zeroizing::new(String::new()),
+        })?;
+        let fingerprint_hex = hex::encode(sec.primary_key.fingerprint().as_bytes());
+        let pub_armored = sec
+            .signed_public_key()
+            .to_armored_string(None.into())
+            .map_err(|e| CryptoError::Key(e.to_string()))?;
+        Ok(PublicKey {
+            armored: pub_armored,
+            fingerprint_hex,
         })
     }
 }

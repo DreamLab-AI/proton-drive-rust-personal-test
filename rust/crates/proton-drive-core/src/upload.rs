@@ -1259,6 +1259,16 @@ mod tests {
                 fingerprint_hex: key.fingerprint_hex.clone(),
             })
         }
+
+        async fn public_key_from_armored(
+            &self,
+            _armored: &str,
+        ) -> std::result::Result<CPubKey, CryptoError> {
+            Ok(CPubKey {
+                armored: "FAKE_PUB_KEY".into(),
+                fingerprint_hex: "12345678".into(),
+            })
+        }
     }
 
     // ── Fake account ──────────────────────────────────────────────────────────
@@ -1281,6 +1291,13 @@ mod tests {
                 fingerprint_hex: "12345678".into(),
                 passphrase: zeroize::Zeroizing::new("addr-pass".into()),
             })
+        }
+
+        async fn address_public_keys(&self, _email: &str) -> Result<Vec<CPubKey>> {
+            Ok(vec![CPubKey {
+                armored: "FAKE_PUB_KEY".into(),
+                fingerprint_hex: "12345678".into(),
+            }])
         }
 
         async fn address_id(&self, _email: &str) -> Result<String> {

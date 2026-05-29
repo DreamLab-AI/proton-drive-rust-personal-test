@@ -6,6 +6,7 @@
 //!   pdtui            — launch the TUI
 //!   pdtui probe      — run live-API diagnostic probes against the configured
 //!                      session, print one JSON object per probe to stdout
+//!   pdtui logout     — clear the keyring entry and truncate session.json
 //!   pdtui where      — print where the session config file should live
 
 #![forbid(unsafe_code)]
@@ -45,6 +46,7 @@ async fn main() -> ExitCode {
         Some("login") => run_login().await,
         Some("mvp") => run_mvp().await,
         Some("probe") => run_probe().await,
+        Some("logout") => run_logout().await,
         Some("where") => {
             println!("{}", session::Session::config_path().display());
             ExitCode::SUCCESS
@@ -71,6 +73,7 @@ USAGE:
     pdtui login           authenticate via SRP and persist session
     pdtui mvp             live round-trip: list root, upload + download a file
     pdtui probe           run live-API diagnostic probes (M1 + M3 e2e)
+    pdtui logout          clear keyring + truncate session.json
     pdtui where           print where the session config file should live
     pdtui help            show this help
 
@@ -135,6 +138,39 @@ async fn run_probe() -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+async fn run_logout() -> ExitCode {
+    let session = match session::Session::load() {
+        Ok(s) => s,
+        Err(_) => {
+            println!("no active session — nothing to log out");
+            return ExitCode::SUCCESS;
+        }
+    };
+    let http = match http::ReqwestHttpClient::new(&session.base_url, &session.app_version) {
+        Ok(c) => Arc::new(c) as Arc<dyn proton_drive::ProtonDriveHttpClient>,
+        Err(e) => {
+            eprintln!("http client init: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match session::SessionManager::from_keyring(http).await {
+        Ok(mgr) => match mgr.logout().await {
+            Ok(()) => {
+                println!("logged out: keyring entry deleted, session.json truncated");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("logout failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("could not load session to log out: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

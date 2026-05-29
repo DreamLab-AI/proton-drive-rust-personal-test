@@ -32,7 +32,7 @@ use proton_drive_api::{
     common::{self, ResponseEnvelope},
     user::{GetUserResponse, User},
 };
-use proton_drive_crypto::{OpenPgpCrypto, PrivateKey};
+use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, PublicKey};
 use serde::de::DeserializeOwned;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
@@ -46,6 +46,10 @@ pub struct PdtuiAccount {
     primary_email: String,
     /// Unlocked address private keys, keyed by lowercased email.
     address_keys: HashMap<String, PrivateKey>,
+    /// All public keys per address (current + rotated-out), keyed by lowercased
+    /// email. Used for signature verification — a revision may be signed by a
+    /// key that has since been replaced (JS `account.getPublicKeys`).
+    address_pub_keys: HashMap<String, Vec<PublicKey>>,
     /// Address IDs (the Proton `AddressID`), keyed by lowercased email.
     address_ids: HashMap<String, String>,
 }
@@ -101,11 +105,32 @@ impl PdtuiAccount {
             .map(|a| (a.email.to_ascii_lowercase(), a.id.clone()))
             .collect();
 
+        // Extract every address key's public portion (current + rotated-out)
+        // for signature verification. The public part of a locked secret-key
+        // block is plaintext, so no unlock is needed — and we must keep keys
+        // that never unlocked, since an old revision can be signed by one.
+        let mut address_pub_keys: HashMap<String, Vec<PublicKey>> = HashMap::new();
+        for addr in &addr_resp.addresses {
+            let mut pubs = Vec::with_capacity(addr.keys.len());
+            for key in &addr.keys {
+                match crypto.public_key_from_armored(&key.private_key).await {
+                    Ok(pk) => pubs.push(pk),
+                    Err(e) => warn!(
+                        key_id = %key.id,
+                        email = %addr.email,
+                        "could not extract address public key: {e}"
+                    ),
+                }
+            }
+            address_pub_keys.insert(addr.email.to_ascii_lowercase(), pubs);
+        }
+
         Ok(Self {
             user_id,
             key_password,
             primary_email,
             address_keys,
+            address_pub_keys,
             address_ids,
         })
     }
@@ -126,6 +151,13 @@ impl ProtonDriveAccount for PdtuiAccount {
             .get(&email.to_ascii_lowercase())
             .cloned()
             .ok_or_else(|| Error::Internal(format!("no unlocked address private key for {email}")))
+    }
+
+    async fn address_public_keys(&self, email: &str) -> Result<Vec<PublicKey>> {
+        self.address_pub_keys
+            .get(&email.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| Error::Internal(format!("no public keys for {email}")))
     }
 
     async fn address_id(&self, email: &str) -> Result<String> {

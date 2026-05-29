@@ -37,6 +37,15 @@ pub struct DownloadStats {
     pub blocks: u32,
     /// Modification time from the XAttr (if present and decryptable).
     pub last_modification_time: Option<std::time::SystemTime>,
+    /// Whether the revision's manifest signature verified against the signer's
+    /// keys. `false` means the data was delivered intact (every block matched
+    /// its SHA-256 hash) but its **authenticity** could not be confirmed — e.g.
+    /// the file was signed by an address key that has since been rotated out and
+    /// is no longer published. This mirrors the JS SDK's
+    /// `isDownloadCompleteWithSignatureIssues()`: bytes are still delivered, the
+    /// signature failure is surfaced for the caller to act on, never silently
+    /// swallowed. A *missing* manifest signature, by contrast, is a hard error.
+    pub signature_verified: bool,
 }
 
 // ── FileDownloader ────────────────────────────────────────────────────────────
@@ -64,8 +73,12 @@ pub struct FileDownloader {
     /// Node's private key (decrypted from NodePassphrase using the share key).
     /// For MVP, only root-level files are supported (parent IS the share root).
     pub(crate) node_private_key: PrivateKey,
-    /// Public key for the address that signed this revision's content.
-    pub(crate) signature_address_pub: Option<proton_drive_crypto::PublicKey>,
+    /// Public keys for the address that signed this revision's content
+    /// (current + rotated-out). Empty when the revision has no signer address;
+    /// verification then falls back to the node's own public key. A revision
+    /// can be signed by a key the address has since replaced, so the whole set
+    /// is carried (JS `getRevisionVerificationKeys` → `account.getPublicKeys`).
+    pub(crate) signature_address_pubs: Vec<proton_drive_crypto::PublicKey>,
     /// ContentKeyPacket from the file link's `FileProperties` (base64 PKESK
     /// wrapping the content session key to the node key). The revision endpoint
     /// does not return it — it lives on the node, like JS `base64ContentKeyPacket`.
@@ -75,11 +88,22 @@ pub struct FileDownloader {
 impl FileDownloader {
     /// Execute the full download protocol writing decrypted plaintext to `writer`.
     ///
-    /// Steps per ADR-0009:
+    /// Order mirrors the JS SDK's `fileDownloader` (ADR-0009): blocks are
+    /// fetched, hash-checked, decrypted, and written *first*, then the manifest
+    /// signature is verified over the collected block hashes. The per-block
+    /// SHA-256 hash check is the fatal data-integrity gate; block payloads
+    /// themselves are not signature-verified (JS deliberately omits this — see
+    /// `fetch_and_decrypt_block`). The manifest signature establishes
+    /// *authenticity*: a missing signature is a hard error, but a present
+    /// signature that fails to verify is reported via
+    /// [`DownloadStats::signature_verified`] rather than discarding the data the
+    /// caller already received.
+    ///
+    /// Steps:
     /// 1. `GET .../revisions/{id}` — fetch blocks + manifest + content key
     /// 2. Decrypt content session key from `ContentKeyPacket`
-    /// 3. Verify manifest signature
-    /// 4. For each block: fetch → hash check → decrypt → write
+    /// 3. For each block: fetch → SHA-256 hash check → decrypt → write
+    /// 4. Verify manifest signature (over the block hashes) → `signature_verified`
     /// 5. XAttr cross-check (size + SHA1); missing XAttr is warned, not fatal
     pub async fn download_to_writer(
         self,
@@ -92,6 +116,18 @@ impl FileDownloader {
             // Server guarantees active revisions have at least one block.
             return Err(Error::Internal(
                 "protocol violation: active revision has no blocks".into(),
+            ));
+        }
+
+        // A *missing* manifest signature means there is no integrity guarantee
+        // at all — abort before any block is fetched or decrypted (no plaintext
+        // must reach the writer). JS cryptoService.verifyManifest throws
+        // IntegrityError ("Missing integrity signature") for this case. The
+        // cryptographic verification itself needs the block hashes and so runs
+        // after the writes (Step 4); only this cheap presence gate is hoisted.
+        if revision.manifest_signature.is_none() {
+            return Err(Error::Verification(
+                "revision has no ManifestSignature — integrity check failed".into(),
             ));
         }
 
@@ -120,30 +156,19 @@ impl FileDownloader {
         // ContentKeyPacketSignature is intentionally not verified here. JS
         // `getContentKeyPacketSessionKey` decrypts with empty verification keys
         // (`decryptAndVerifySessionKey(..., nodeKey, [])`); download integrity is
-        // guaranteed by the manifest signature, per-block embedded signatures,
-        // and the SHA-256 ciphertext hash checks below.
+        // guaranteed by the manifest signature and the SHA-256 ciphertext hash
+        // checks below.
 
-        // ── Step 3: verify manifest signature ────────────────────────────────
-        // manifest_payload = concat(raw_hash_bytes for block in blocks, sorted by index)
-        let manifest_sig_armored = revision.manifest_signature.as_deref();
         let mut sorted_blocks = revision.blocks.clone();
         sorted_blocks.sort_by_key(|b| b.index);
 
-        self.verify_manifest(&sorted_blocks, manifest_sig_armored)
-            .await?;
-
-        // ── Steps 4 & 5: per-block fetch → verify → decrypt → write ─────────
-        let verification_keys: Vec<proton_drive_crypto::PublicKey> =
-            self.signature_address_pub.iter().cloned().collect();
-
+        // ── Step 3: per-block fetch → SHA-256 hash check → decrypt → write ───
         let mut total_bytes: u64 = 0;
         let mut total_blocks: u32 = 0;
         let mut sha1_hasher = sha1::Sha1::new();
 
         for block in &sorted_blocks {
-            let plaintext = self
-                .fetch_and_decrypt_block(block, &session_key, &verification_keys)
-                .await?;
+            let plaintext = self.fetch_and_decrypt_block(block, &session_key).await?;
 
             sha1_hasher.update(&plaintext);
             total_bytes += plaintext.len() as u64;
@@ -160,6 +185,15 @@ impl FileDownloader {
             .await
             .map_err(|e| Error::Internal(format!("flush error: {e}")))?;
 
+        // ── Step 4: verify manifest signature over the block hashes ──────────
+        // Done after the data is delivered, like JS `fileDownloader`. A missing
+        // signature is fatal; a present-but-unverifiable signature surfaces as
+        // signature_verified=false (the bytes are intact per the hash checks).
+        let manifest_sig_armored = revision.manifest_signature.as_deref();
+        let signature_verified = self
+            .verify_manifest(&sorted_blocks, manifest_sig_armored)
+            .await?;
+
         // ── Step 5 (XAttr) ────────────────────────────────────────────────────
         let last_modification_time = self
             .verify_xattr(
@@ -173,6 +207,7 @@ impl FileDownloader {
             bytes: total_bytes,
             blocks: total_blocks,
             last_modification_time,
+            signature_verified,
         })
     }
 
@@ -207,11 +242,18 @@ impl FileDownloader {
         Ok(env.inner.revision)
     }
 
+    /// Verify the revision's manifest signature over the concatenated block
+    /// hashes. Returns `Ok(true)` when the signature verifies, `Ok(false)` when
+    /// a signature is present but cannot be verified against the signer's keys
+    /// (authenticity unconfirmed — caller surfaces this via
+    /// `DownloadStats::signature_verified`), and `Err` when the signature is
+    /// *missing* (a hard integrity failure, matching JS `verifyManifest`'s
+    /// `IntegrityError("Missing integrity signature")`).
     async fn verify_manifest(
         &self,
         sorted_blocks: &[BlockResponse],
         manifest_sig_armored: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Missing manifest signature is an integrity failure, not a legacy
         // tolerance. JS cryptoService.verifyManifest throws IntegrityError
         // ("Missing integrity signature") when armoredManifestSignature is absent.
@@ -239,14 +281,16 @@ impl FileDownloader {
             .decode(manifest_sig)
             .unwrap_or_else(|_| manifest_sig.as_bytes().to_vec());
 
-        // Verification keys: the signer address's public key when known,
-        // otherwise fall back to the node's own public key. JS
+        // Verification keys: the signer address's full public key set when
+        // known (current + rotated-out — the revision may be signed by an old
+        // key), otherwise fall back to the node's own public key. JS
         // getRevisionVerificationKeys returns `[nodeKey]` when no signer email
         // is present — it never skips verification.
         let verification_keys: Vec<proton_drive_crypto::PublicKey> =
-            match self.signature_address_pub.as_ref() {
-                Some(addr_pub) => vec![addr_pub.clone()],
-                None => vec![self.crypto.public_key(&self.node_private_key).await?],
+            if self.signature_address_pubs.is_empty() {
+                vec![self.crypto.public_key(&self.node_private_key).await?]
+            } else {
+                self.signature_address_pubs.clone()
             };
 
         let status = self
@@ -254,13 +298,23 @@ impl FileDownloader {
             .verify(&manifest_payload, &sig_bytes, &verification_keys)
             .await?;
 
-        // Only a valid signature passes. NoSignature / invalid / wrong-signer
-        // all fail: JS requires verified == SIGNED_AND_VALID.
+        // A valid signature confirms authenticity. Anything else (no matching
+        // signer / invalid) means the signature is present but unverifiable —
+        // the bytes are still intact (every block matched its SHA-256 hash), so
+        // we report rather than discard, mirroring JS's
+        // isDownloadCompleteWithSignatureIssues. A *missing* signature was
+        // already rejected above as a hard integrity failure.
         match status {
-            VerificationStatus::Ok => Ok(()),
-            other => Err(Error::Verification(format!(
-                "ManifestSignature {other:?} — aborting before any block is decrypted"
-            ))),
+            VerificationStatus::Ok => Ok(true),
+            other => {
+                tracing::warn!(
+                    node = %self.node_uid.node_id,
+                    status = ?other,
+                    "manifest signature present but unverifiable — data delivered, \
+                     authenticity unconfirmed (signer key may have been rotated out)"
+                );
+                Ok(false)
+            }
         }
     }
 
@@ -268,9 +322,8 @@ impl FileDownloader {
         &self,
         block: &BlockResponse,
         session_key: &proton_drive_crypto::SessionKey,
-        verification_keys: &[proton_drive_crypto::PublicKey],
     ) -> Result<Vec<u8>> {
-        // Step 4a: GET BareURL. Storage endpoints authenticate with the
+        // Step 3a: GET BareURL. Storage endpoints authenticate with the
         // `pm-storage-token` header, not the API bearer (JS `makeStorageRequest`).
         let req = BlobRequest {
             method: HttpMethod::Get,
@@ -282,7 +335,8 @@ impl FileDownloader {
         let resp = self.http.request_blob(req).await?;
         let ciphertext = resp.body.to_vec();
 
-        // Step 4b: assert sha256(ciphertext) == block.Hash
+        // Step 3b: assert sha256(ciphertext) == block.Hash. This is the fatal
+        // data-integrity gate — a mismatch means the bytes are corrupt/tampered.
         let actual_hash = sha2::Sha256::digest(&ciphertext);
         let actual_hash_b64 = base64::engine::general_purpose::STANDARD.encode(actual_hash);
         if actual_hash_b64 != block.hash {
@@ -292,22 +346,17 @@ impl FileDownloader {
             )));
         }
 
-        // Step 4c: decrypt_and_verify
-        let (plaintext, sig_status) = self
+        // Step 3c: decrypt. Block payloads are NOT signature-verified: JS
+        // `decryptBlock` decrypts with the content session key and passes no
+        // verification keys ("We do not verify signatures on blocks ... Any
+        // issue on the blocks should be considered serious integrity issue").
+        // Authenticity is established by the manifest signature; the SHA-256
+        // hash check above guards data integrity.
+        let (plaintext, _sig_status) = self
             .crypto
-            .decrypt_and_verify(&ciphertext, session_key, verification_keys)
+            .decrypt_and_verify(&ciphertext, session_key, &[])
             .await
             .map_err(|e| Error::Decryption(format!("block {}: {e}", block.index)))?;
-
-        match sig_status {
-            VerificationStatus::Ok | VerificationStatus::NoSignature => {}
-            VerificationStatus::SignatureInvalid | VerificationStatus::SignatureWrongSigner => {
-                return Err(Error::Verification(format!(
-                    "block {} signature {:?} — aborting",
-                    block.index, sig_status
-                )));
-            }
-        }
 
         Ok(plaintext)
     }
@@ -434,7 +483,7 @@ pub struct FileDownloaderContext {
     pub share_id: String,
     pub revision_id: String,
     pub node_private_key: PrivateKey,
-    pub signature_address_pub: Option<proton_drive_crypto::PublicKey>,
+    pub signature_address_pubs: Vec<proton_drive_crypto::PublicKey>,
 }
 
 /// Resolve the volume ID from a share ID.
@@ -509,9 +558,10 @@ pub async fn resolve_active_revision(
 /// Full node key decryption: decrypt passphrase from NodePassphrase, then
 /// unlock the NodeKey armored private key with that passphrase.
 ///
-/// MVP restriction: `parent_key` must be the **share key** (root-level files only).
-///
-/// FIXME: NodeUid naming — see MC commit f6b29b1
+/// `parent_key` is the node's *immediate* parent key: the share key for the
+/// share root node, or the parent **node** key for any nested node. Callers
+/// walk the parent chain (see `ProtonDriveClient::resolve_node_key_via_chain`)
+/// to assemble the right `parent_key` for nested nodes.
 pub async fn decrypt_node_private_key(
     crypto: &Arc<dyn OpenPgpCrypto>,
     node_key_armored: &str,
@@ -805,7 +855,7 @@ mod tests {
             revision_id: "rev-1".into(),
             // We encrypted the session key to sign_key so use sign_key as node_private_key.
             node_private_key: sign_key,
-            signature_address_pub: Some(sign_pub),
+            signature_address_pubs: vec![sign_pub],
             content_key_packet: None,
         };
 
@@ -815,6 +865,100 @@ mod tests {
         assert_eq!(output, plaintext);
         assert_eq!(stats.bytes, plaintext.len() as u64);
         assert_eq!(stats.blocks, 1);
+        assert!(
+            stats.signature_verified,
+            "manifest signed by the resolved verification key must verify"
+        );
+    }
+
+    /// JS-faithful soft failure: a manifest signed by a key the downloader
+    /// cannot resolve (e.g. the signer's key was rotated out of the account)
+    /// must still deliver the byte-identical data — the SHA-256 hash checks
+    /// already proved block integrity — while reporting
+    /// `signature_verified == false`. This mirrors JS's
+    /// `isDownloadCompleteWithSignatureIssues`: the official client downloads
+    /// such files rather than discarding them.
+    #[tokio::test]
+    async fn manifest_wrong_signer_delivers_data_unverified() {
+        // node key (decrypts the block / content key); a *different* key signs
+        // the manifest, standing in for a since-rotated signer key.
+        let (crypto, node_key, node_pub) = make_crypto_material("node-pass").await;
+        let crypto = Arc::new(crypto);
+        let (_c2, other_key, _other_pub) = make_crypto_material("other-pass").await;
+
+        let plaintext = b"data signed by a rotated-out key";
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let ciphertext = crypto
+            .encrypt_and_sign(
+                plaintext,
+                &session_key,
+                std::slice::from_ref(&node_pub),
+                &node_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let hash = block_hash_b64(&ciphertext);
+        let ckp_bytes = crypto
+            .encrypt_session_key(&session_key, std::slice::from_ref(&node_pub))
+            .await
+            .unwrap();
+        let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
+
+        // Manifest signed by `other_key`, which is NOT in signature_address_pubs
+        // and is NOT the node key — so verification cannot succeed.
+        let hash_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&hash)
+            .unwrap();
+        let manifest_sig = crypto.sign(&hash_bytes, &other_key, "").await.unwrap();
+        let manifest_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1", "State": 1,
+                "Blocks": [{"Index": 1, "BareURL": "https://cdn/block", "Token": "t",
+                             "Hash": hash, "EncryptedSignature": null,
+                             "Size": ciphertext.len() as u64}],
+                "ManifestSignature": manifest_sig_b64, "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add("revisions/rev-1", Bytes::from(revision_json));
+        mock.add("cdn/block", Bytes::from(ciphertext));
+
+        let downloader = FileDownloader {
+            http: Arc::new(mock),
+            crypto,
+            node_uid: NodeUid {
+                volume_id: "v".into(),
+                node_id: "l".into(),
+            },
+            volume_id: "v".into(),
+            share_id: "s".into(),
+            revision_id: "rev-1".into(),
+            node_private_key: node_key,
+            // node_pub here would verify the block but NOT the manifest (signed
+            // by other_key); leaving it empty forces node-key fallback, which
+            // also fails to verify other_key's signature.
+            signature_address_pubs: Vec::new(),
+            content_key_packet: None,
+        };
+
+        let mut out = Vec::new();
+        let stats = downloader.download_to_writer(&mut out).await.unwrap();
+        assert_eq!(out, plaintext, "data must be delivered byte-identical");
+        assert_eq!(stats.blocks, 1);
+        assert!(
+            !stats.signature_verified,
+            "manifest signed by an unresolvable key must report signature_verified=false"
+        );
     }
 
     /// Tampered block: SHA-256 hash mismatch → `Error::Integrity`.
@@ -890,7 +1034,7 @@ mod tests {
             share_id: "s".into(),
             revision_id: "rev-1".into(),
             node_private_key: sign_key,
-            signature_address_pub: Some(sign_pub),
+            signature_address_pubs: vec![sign_pub],
             content_key_packet: None,
         };
 
@@ -922,7 +1066,7 @@ mod tests {
             share_id: "s".into(),
             revision_id: "rev-missing".into(),
             node_private_key: sign_key,
-            signature_address_pub: Some(sign_pub),
+            signature_address_pubs: vec![sign_pub],
             content_key_packet: None,
         };
 
@@ -991,7 +1135,7 @@ mod tests {
             share_id: "s".into(),
             revision_id: "rev-1".into(),
             node_private_key: sign_key,
-            signature_address_pub: Some(sign_pub),
+            signature_address_pubs: vec![sign_pub],
             content_key_packet: None,
         };
 
@@ -1035,7 +1179,7 @@ mod tests {
         let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
 
         // Manifest signed by the node key — the only key the downloader can
-        // fall back to, since signature_address_pub is None.
+        // fall back to, since signature_address_pubs is empty.
         let hash_bytes = base64::engine::general_purpose::STANDARD
             .decode(&hash)
             .unwrap();
@@ -1070,7 +1214,7 @@ mod tests {
             share_id: "s".into(),
             revision_id: "rev-1".into(),
             node_private_key: node_key,
-            signature_address_pub: None,
+            signature_address_pubs: Vec::new(),
             content_key_packet: None,
         };
 

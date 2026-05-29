@@ -4,7 +4,7 @@
 //! [`ProtonDriveAccount`]. Mirrors `js/sdk/src/interface/account.ts`.
 
 use async_trait::async_trait;
-use proton_drive_crypto::PrivateKey;
+use proton_drive_crypto::{PrivateKey, PublicKey};
 
 use crate::error::Result;
 
@@ -20,6 +20,13 @@ pub trait ProtonDriveAccount: Send + Sync {
     /// Resolve an address's private key. Used to decrypt content addressed
     /// to that address.
     async fn address_private_key(&self, email: &str) -> Result<PrivateKey>;
+
+    /// Resolve **all** public keys for an address (current + rotated-out), for
+    /// signature verification. Mirrors JS `account.getPublicKeys(email)`. A
+    /// revision can be signed by a key that has since been replaced, so the
+    /// verifier must consider the address's whole key history, not just the
+    /// primary key's public portion.
+    async fn address_public_keys(&self, email: &str) -> Result<Vec<PublicKey>>;
 
     /// Resolve an address's stable ID (the Proton `AddressID`, not the email).
     /// Block-upload and revision endpoints key on this ID.

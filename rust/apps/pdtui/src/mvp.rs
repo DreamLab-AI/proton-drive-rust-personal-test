@@ -135,18 +135,140 @@ pub async fn run() -> Result<(), String> {
     let roundtrip = tokio::fs::read(&dest)
         .await
         .map_err(|e| format!("read back {}: {e}", dest.display()))?;
-    println!("✓ downloaded {} bytes to {}", stats.bytes, dest.display());
+    println!(
+        "✓ downloaded {} bytes to {} (signature_verified={})",
+        stats.bytes,
+        dest.display(),
+        stats.signature_verified
+    );
 
-    if roundtrip == content {
-        println!("✓ PASS — {} bytes byte-identical round-trip", content.len());
-        Ok(())
-    } else {
-        Err(format!(
+    if roundtrip != content {
+        return Err(format!(
             "BYTE MISMATCH: uploaded {} bytes, downloaded {} bytes",
             content.len(),
             roundtrip.len()
-        ))
+        ));
     }
+    // We just signed this revision with our own (current) address key, so the
+    // manifest signature must verify. A false here is a regression in the
+    // verification-key resolution, not a tolerated rotated-key case.
+    if !stats.signature_verified {
+        return Err(
+            "round-trip manifest signature did not verify against our own freshly-signed \
+             revision — verification-key resolution regression"
+                .into(),
+        );
+    }
+    println!(
+        "✓ PASS — {} bytes byte-identical round-trip, manifest signature verified",
+        content.len()
+    );
+
+    // ── step 6: opportunistic nested-download check ──────────────────────────
+    // Exercises `resolve_node_key_via_chain` at depth ≥3 against real nested
+    // content (a file inside a subfolder). Read-only and non-fatal: if the
+    // Drive has no nested file the probe is skipped, not failed.
+    match probe_nested_download(&client, &root_uid).await {
+        Ok(true) => {}
+        Ok(false) => println!("nested probe: skipped (no subfolder/file to exercise)"),
+        Err(e) => return Err(format!("nested download regression: {e}")),
+    }
+    Ok(())
+}
+
+/// Walk one folder deep and download the first file found there, exercising the
+/// parent-chain node-key derivation for nested nodes. Returns `Ok(true)` if a
+/// nested file was downloaded, `Ok(false)` if there was nothing nested to test,
+/// and `Err` only if a located nested file failed to download (a regression).
+async fn probe_nested_download(
+    client: &ProtonDriveClient,
+    root_uid: &proton_drive::NodeUid,
+) -> Result<bool, String> {
+    // First non-trashed subfolder under root.
+    let mut folder = None;
+    let mut stream = client.iter_folder_children(root_uid, FolderChildrenFilter::default());
+    while let Some(item) = stream.next().await {
+        if let MaybeNode::Node(n) = item.map_err(|e| format!("list root: {e}"))?
+            && !n.trashed
+            && matches!(n.node_type, NodeType::Folder)
+        {
+            folder = Some((n.uid.clone(), n.name.clone()));
+            break;
+        }
+    }
+    drop(stream);
+    let Some((folder_uid, folder_name)) = folder else {
+        return Ok(false);
+    };
+    println!("nested probe: descending into folder '{folder_name}'");
+
+    // First non-trashed file inside that subfolder. Listing it already
+    // exercises the chain walk (child names decrypt with the subfolder key).
+    let mut file = None;
+    let mut stream = client.iter_folder_children(&folder_uid, FolderChildrenFilter::default());
+    while let Some(item) = stream.next().await {
+        if let MaybeNode::Node(n) = item.map_err(|e| format!("list '{folder_name}': {e}"))?
+            && !n.trashed
+            && matches!(n.node_type, NodeType::File)
+        {
+            file = Some((n.uid.clone(), n.name.clone()));
+            break;
+        }
+    }
+    drop(stream);
+    let Some((file_uid, file_name)) = file else {
+        return Ok(false);
+    };
+
+    // file_downloader resolves the node key by walking file → subfolder → root
+    // → share key. Its success IS the parent-chain key-derivation proof, so a
+    // failure here is a genuine regression in this work and is fatal.
+    let downloader = client
+        .file_downloader(&file_uid)
+        .await
+        .map_err(|e| format!("nested file_downloader '{folder_name}/{file_name}': {e}"))?;
+
+    // The actual byte transfer + manifest/block verification is an orthogonal
+    // integrity concern on a pre-existing file we did not create. Report a
+    // failure here as a finding rather than failing the round-trip MVP — the
+    // chain walk above already succeeded.
+    match downloader.download_to_writer(tokio::io::sink()).await {
+        Ok(stats) if stats.signature_verified => {
+            println!(
+                "  ✓ nested PASS — decrypted + downloaded {} bytes from \
+                 '{folder_name}/{file_name}' via parent-chain key derivation \
+                 (manifest signature verified)",
+                stats.bytes
+            );
+        }
+        Ok(stats) => {
+            // Data delivered byte-for-byte (every block matched its SHA-256
+            // hash) but the manifest signature could not be verified — almost
+            // always because the signer's key was rotated out of the account.
+            // The official Proton client downloads such files too; we mirror
+            // that, surfacing the unverified state rather than failing.
+            println!(
+                "  ✓ nested PASS — decrypted + downloaded {} bytes from \
+                 '{folder_name}/{file_name}' via parent-chain key derivation",
+                stats.bytes
+            );
+            println!(
+                "    (manifest signature present but unverifiable — signer key likely \
+                 rotated out; blocks are intact per SHA-256 hash checks)"
+            );
+        }
+        Err(e) => {
+            // A hard error now means something other than a rotated signer key
+            // (e.g. a missing manifest signature or a block hash mismatch) — a
+            // genuine integrity problem worth reporting.
+            println!("  ! nested download of '{folder_name}/{file_name}' did not complete: {e}");
+            println!(
+                "    (parent-chain key derivation succeeded — file_downloader resolved \
+                 the node key; the failure is in download/integrity, not key derivation)"
+            );
+        }
+    }
+    Ok(true)
 }
 
 /// Resume the persisted session and assemble a live `ProtonDriveClient`.
