@@ -609,8 +609,9 @@ pub mod auth {
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct RefreshResponse {
-        #[serde(rename = "UID")]
-        pub uid: String,
+        // The refresh response's `UID` is deprecated and optional on the wire —
+        // the UID is supplied via the `x-pm-uid` request header, and `do_refresh`
+        // keeps using the session's existing UID. Only the rotated tokens matter.
         pub access_token: String,
         pub refresh_token: String,
     }
