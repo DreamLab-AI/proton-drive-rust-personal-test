@@ -4,6 +4,19 @@ Personal-use Rust port of the Proton Drive SDK plus a two-pane tmux-ready TUI.
 Scope and decisions live in [`../docs/PRD-rust-port-and-tui.md`](../docs/PRD-rust-port-and-tui.md),
 [`../docs/adr/`](../docs/adr/), and [`../docs/domain-model.md`](../docs/domain-model.md).
 
+> **⚠️ Working MVP — NOT audited. Use at your own risk.**
+>
+> This is a functional MVP: SRP login, folder listing, and a byte-identical
+> upload/download round-trip work against the live Proton Drive API. It has
+> **not** undergone a security audit or independent cryptographic review, and
+> it is **not** an official Proton product.
+>
+> Proton Drive users should **not** expect this to work without risks or bugs.
+> The crypto and wire-format paths were reverse-engineered against the JS SDK
+> and validated by round-trip only — edge cases, error handling, and concurrent
+> access are largely untested. Do not rely on it for data you cannot afford to
+> lose or expose. No warranty of correctness, durability, or confidentiality.
+
 ## Layout
 
 ```
